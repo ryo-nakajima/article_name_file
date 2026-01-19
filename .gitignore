@@ -13,6 +13,7 @@ rename_results_final.json
 
 # Output folders
 japanese/
+re-search/
 
 # Python cache
 __pycache__/

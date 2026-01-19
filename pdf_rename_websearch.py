@@ -30,6 +30,8 @@ import os
 import re
 import json
 import time
+import shutil
+import subprocess
 import pypdf
 import pdfplumber
 import pytesseract
@@ -44,6 +46,37 @@ warnings.filterwarnings('ignore')
 # Suppress PDF parsing warnings
 logging.getLogger('pypdf').setLevel(logging.ERROR)
 logging.getLogger('pdfminer').setLevel(logging.ERROR)
+
+# Check and install system dependencies (poppler, tesseract)
+def check_and_install_dependencies():
+    """Check if poppler and tesseract are installed, install via Homebrew if missing."""
+    dependencies = {
+        'pdftoppm': 'poppler',    # pdftoppm is part of poppler
+        'tesseract': 'tesseract'
+    }
+    
+    for cmd, package in dependencies.items():
+        if shutil.which(cmd) is None:
+            print(f"Installing {package} (required for OCR)...")
+            try:
+                result = subprocess.run(
+                    ['brew', 'install', package],
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+                if result.returncode == 0:
+                    print(f"  {package} installed successfully")
+                else:
+                    print(f"  Failed to install {package}: {result.stderr}")
+            except FileNotFoundError:
+                print(f"  Homebrew not found. Please install {package} manually: brew install {package}")
+            except subprocess.TimeoutExpired:
+                print(f"  Installation timed out for {package}")
+        else:
+            print(f"{cmd}: OK")
+
+check_and_install_dependencies()
 
 # OpenAI API setup
 openai_client = OpenAI()  # Uses OPENAI_API_KEY from environment
@@ -1520,7 +1553,7 @@ for i, filename in enumerate(sorted(pdf_files)):
     pdf_data.append({
         'filename': filename,
         'title': title,
-        'title_method': method,  # 'text', 'ocr', or 'none'
+        'title_method': method,  # 'text', 'text_gpt', 'ocr', 'ocr_gpt', or 'none'
         'title_error': error,    # error type if failed
         'meta_authors': meta_authors,
         'meta_year': meta_year,
@@ -1535,8 +1568,10 @@ for i, filename in enumerate(sorted(pdf_files)):
 # Summary statistics
 japanese_count = sum(1 for x in pdf_data if x['status'] == 'japanese')
 title_count = sum(1 for x in pdf_data if x['title'])
-text_count = sum(1 for x in pdf_data if x.get('title_method') == 'text')
-ocr_count = sum(1 for x in pdf_data if x.get('title_method') == 'ocr')
+# Count text extraction (includes 'text' and 'text_gpt')
+text_count = sum(1 for x in pdf_data if x.get('title_method', '').startswith('text'))
+# Count OCR extraction (includes 'ocr' and 'ocr_gpt')
+ocr_count = sum(1 for x in pdf_data if x.get('title_method', '').startswith('ocr'))
 
 # Count extraction errors
 error_counts = {}
@@ -1605,10 +1640,20 @@ for i, item in enumerate(pdf_data):
 with open(os.path.join(ARTICLES_DIR, 'websearch_progress.json'), 'w') as f:
     json.dump(pdf_data, f, ensure_ascii=False, indent=2)
 
+# WebSearch statistics
+ws_success = sum(1 for x in pdf_data if x.get('websearch_authors'))
+ws_semantic = sum(1 for x in pdf_data if x.get('websearch_source') == 'semantic_scholar')
+ws_crossref = sum(1 for x in pdf_data if x.get('websearch_source') == 'crossref')
+ws_no_title = sum(1 for x in pdf_data if x['status'] != 'japanese' and not x['title'])
+ws_not_found = sum(1 for x in pdf_data if x['status'] != 'japanese' and x['title'] and not x.get('websearch_authors'))
+
 print(f"\nWebSearch complete at {datetime.now()}")
-print(f"Files with WebSearch results: {sum(1 for x in pdf_data if x['websearch_authors'])}")
-print(f"  - From Semantic Scholar: {sum(1 for x in pdf_data if x.get('websearch_source') == 'semantic_scholar')}")
-print(f"  - From CrossRef: {sum(1 for x in pdf_data if x.get('websearch_source') == 'crossref')}")
+print(f"Files with WebSearch results: {ws_success}")
+print(f"  - From Semantic Scholar: {ws_semantic}")
+print(f"  - From CrossRef: {ws_crossref}")
+print(f"Files without WebSearch results: {ws_no_title + ws_not_found}")
+print(f"  - No title extracted: {ws_no_title}")
+print(f"  - Title found but search failed: {ws_not_found}")
 
 # %%
 # Cell 8: Step 3 - Compare WebSearch results with metadata and determine final authors/year
@@ -1938,8 +1983,8 @@ summary = {
     'alert': sum(1 for x in pdf_data if x['status'] == 'alert'),
     'japanese': sum(1 for x in pdf_data if x['status'] == 'japanese'),
     'title_extraction': {
-        'text': sum(1 for x in pdf_data if x.get('title_method') == 'text'),
-        'ocr': sum(1 for x in pdf_data if x.get('title_method') == 'ocr'),
+        'text': sum(1 for x in pdf_data if x.get('title_method', '').startswith('text')),
+        'ocr': sum(1 for x in pdf_data if x.get('title_method', '').startswith('ocr')),
         'none': sum(1 for x in pdf_data if x.get('title_method') == 'none'),
     },
     'title_errors': {},
@@ -1952,6 +1997,8 @@ summary = {
     'websearch_sources': {
         'semantic_scholar': sum(1 for x in pdf_data if x.get('websearch_source') == 'semantic_scholar'),
         'crossref': sum(1 for x in pdf_data if x.get('websearch_source') == 'crossref'),
+        'no_title': sum(1 for x in pdf_data if x['status'] != 'japanese' and not x['title']),
+        'not_found': sum(1 for x in pdf_data if x['status'] != 'japanese' and x['title'] and not x.get('websearch_authors')),
     },
     'year_sources': {
         'metadata': sum(1 for x in pdf_data if x.get('year_source') == 'metadata'),
