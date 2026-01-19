@@ -15,6 +15,7 @@ pdf_processing_progress.json
 # Output folders
 japanese/
 re-search/
+alert/
 failure/
 
 # Python cache

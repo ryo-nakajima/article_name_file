@@ -1943,6 +1943,113 @@ def extract_authors_with_gpt_validation(pdf_path: str, use_gpt: bool = True) -> 
     return authors, year, method
 
 
+def extract_authors_from_ocr_with_gpt(pdf_path: str, title: str = None) -> Tuple[List[str], Optional[str]]:
+    """
+    Last-resort author extraction using OCR + GPT.
+
+    This is used for fail files where:
+    - Title extraction was wrong → WebSearch failed
+    - Pattern-based author extraction also failed
+
+    GPT analyzes the OCR text directly to find author names.
+
+    Returns: (authors, year)
+    """
+    try:
+        # Get OCR text from first 2 pages
+        images = convert_from_path(pdf_path, first_page=1, last_page=2, dpi=200)
+        if not images:
+            return [], None
+
+        ocr_text = ""
+        for image in images:
+            text = pytesseract.image_to_string(image, lang='eng')
+            if text:
+                ocr_text += text + "\n"
+
+        if len(ocr_text) < 100:
+            return [], None
+
+        # Limit text to first ~3000 chars (focus on header area)
+        ocr_text = ocr_text[:3000]
+
+        # Ask GPT to extract authors
+        title_context = f'Paper title (if helpful): "{title}"\n\n' if title else ""
+
+        messages = [
+            {
+                "role": "system",
+                "content": """You are extracting author surnames from academic paper OCR text.
+
+Return JSON: {"surnames": ["Surname1", "Surname2"], "year": "YYYY" or null, "confidence": "high/medium/low"}
+
+Rules:
+1. Look for the AUTHOR LINE near the top of the paper (usually after title, before abstract)
+2. Author names are typically: "FirstName LastName" or "F. LastName" or "FIRSTNAME LASTNAME"
+3. Return ONLY surnames (family names), not first names
+4. Common patterns:
+   - "John Smith, Jane Doe, and Bob Johnson" → ["Smith", "Doe", "Johnson"]
+   - "J. Smith¹, J. Doe²" → ["Smith", "Doe"]
+   - Names in ALL CAPS: "JOHN SMITH" → ["Smith"]
+5. IGNORE:
+   - University/institution names
+   - Email addresses
+   - "Abstract", "Introduction", "Keywords" sections
+   - Journal names, copyright text
+6. If names look concatenated (no spaces), try to separate them
+7. Return empty array if you cannot reliably identify authors
+8. Also extract publication year if visible (look for © year, "Published: year", etc.)"""
+            },
+            {
+                "role": "user",
+                "content": f"""{title_context}OCR text from PDF (first pages):
+
+{ocr_text}
+
+Extract author surnames and year."""
+            }
+        ]
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.1,
+            max_tokens=500,
+            timeout=30
+        )
+
+        result = json.loads(response.choices[0].message.content)
+        surnames = result.get('surnames', [])
+        year = result.get('year')
+        confidence = result.get('confidence', 'low')
+
+        # Validate surnames
+        valid_surnames = []
+        for name in surnames:
+            if not name or len(name) < 2:
+                continue
+            # Clean and validate
+            name = re.sub(r'[^\w\u00C0-\u024F\'-]', '', name)
+            if name and is_valid_surname(name):
+                valid_surnames.append(normalize_case(name))
+
+        # Validate year
+        if year:
+            try:
+                y = int(year)
+                if not (1960 <= y <= 2026):
+                    year = None
+            except:
+                year = None
+
+        return valid_surnames, year
+
+    except Exception as e:
+        print(f"    OCR+GPT extraction error: {e}")
+        return [], None
+
+
 print("PDF text search functions defined.")
 
 
@@ -2127,6 +2234,24 @@ print(f"Starting extraction at {datetime.now()}")
 
 # Load existing progress
 progress = load_progress()
+
+# Auto-remove entries for files in failure/ directory (enables reprocessing)
+# When user moves files back from failure/ to ARTICLES_DIR, they will be reprocessed
+failure_dir = os.path.join(ARTICLES_DIR, 'failure')
+if os.path.exists(failure_dir):
+    failure_pdfs = [f for f in os.listdir(failure_dir) if f.lower().endswith('.pdf')]
+    if failure_pdfs:
+        removed_for_reprocess = 0
+        for fname in failure_pdfs:
+            fpath = os.path.join(failure_dir, fname)
+            fhash = calculate_file_hash(fpath)
+            if fhash and fhash in progress['by_hash']:
+                del progress['by_hash'][fhash]
+                removed_for_reprocess += 1
+        if removed_for_reprocess > 0:
+            print(f"Removed {removed_for_reprocess} entries for files in failure/ (ready for reprocessing)")
+            save_progress(progress)
+
 print(f"Loaded progress: {len(progress['by_hash'])} files previously processed")
 
 # Get current PDF files and calculate hashes
@@ -2498,6 +2623,119 @@ if GPT_VALIDATE_PDF_TEXT:
 
 
 # %%
+# Cell 9.5: Last-resort OCR+GPT extraction for fail files
+# - Targets files with status='fail' and fail_reason='no_valid_authors'
+# - Uses OCR + GPT to extract authors directly from PDF images
+# - If successful, changes status to 'alert' (requires human verification)
+# - If still fails, keeps status='fail'
+
+OCR_GPT_FALLBACK = True  # Set to False to skip this step
+
+fail_files = [x for x in pdf_data
+              if x['status'] == 'fail'
+              and x.get('fail_reason') == 'no_valid_authors'
+              and x.get('ocr_gpt_attempted') != True]
+
+print(f"\n=== Cell 9.5: Last-resort OCR+GPT extraction ===")
+print(f"Files to process: {len(fail_files)} (fail with no_valid_authors)")
+
+if OCR_GPT_FALLBACK and fail_files:
+    ocr_gpt_success = 0
+    ocr_gpt_fail = 0
+
+    for i, item in enumerate(fail_files):
+        if (i + 1) % 10 == 0:
+            print(f"Processing {i+1}/{len(fail_files)}...")
+
+        filename = item['filename']
+        file_hash = item.get('file_hash', '')
+
+        # Find current file path (may have been renamed)
+        current_filename = None
+        for f in os.listdir(ARTICLES_DIR):
+            if f.lower().endswith('.pdf'):
+                path = os.path.join(ARTICLES_DIR, f)
+                if calculate_file_hash(path) == file_hash:
+                    current_filename = f
+                    break
+
+        if not current_filename:
+            print(f"  File not found: {filename}")
+            item['ocr_gpt_attempted'] = True
+            ocr_gpt_fail += 1
+            continue
+
+        pdf_path = os.path.join(ARTICLES_DIR, current_filename)
+        title = item.get('title')
+
+        # Extract authors using OCR + GPT
+        authors, year = extract_authors_from_ocr_with_gpt(pdf_path, title)
+
+        item['ocr_gpt_attempted'] = True
+        item['ocr_gpt_authors'] = authors
+        item['ocr_gpt_year'] = year
+
+        if authors:
+            # Success! Change to alert status
+            item['final_authors'] = authors
+            item['author_source'] = 'ocr_gpt_fallback'
+            if year and not item.get('final_year'):
+                item['final_year'] = year
+                item['year_source'] = 'ocr_gpt_fallback'
+
+            # Check if we now have valid data
+            if item['final_authors'] and item.get('final_year'):
+                item['status'] = 'alert'
+                item['alert_reason'] = 'ocr_gpt_fallback'
+                del item['fail_reason']
+                ocr_gpt_success += 1
+                print(f"  Recovered: {current_filename} → {authors}")
+            elif item['final_authors']:
+                # Have authors but no year - still alert (can use n.d.)
+                item['status'] = 'alert'
+                item['alert_reason'] = 'ocr_gpt_fallback_no_year'
+                del item['fail_reason']
+                ocr_gpt_success += 1
+                print(f"  Recovered (no year): {current_filename} → {authors}")
+            else:
+                ocr_gpt_fail += 1
+        else:
+            ocr_gpt_fail += 1
+
+    print(f"\nOCR+GPT fallback results:")
+    print(f"  Recovered to alert: {ocr_gpt_success}")
+    print(f"  Still fail: {ocr_gpt_fail}")
+
+    # Update progress
+    for item in pdf_data:
+        file_hash = item.get('file_hash', '')
+        if file_hash and file_hash in progress['by_hash']:
+            progress['by_hash'][file_hash].update({
+                'status': item['status'],
+                'final_authors': item.get('final_authors'),
+                'final_year': item.get('final_year'),
+                'author_source': item.get('author_source'),
+                'ocr_gpt_attempted': item.get('ocr_gpt_attempted'),
+                'ocr_gpt_authors': item.get('ocr_gpt_authors'),
+                'alert_reason': item.get('alert_reason'),
+                'fail_reason': item.get('fail_reason')
+            })
+    save_progress(progress)
+
+# Final counts after OCR+GPT fallback
+success_count = sum(1 for x in pdf_data if x['status'] == 'success')
+fail_count = sum(1 for x in pdf_data if x['status'] == 'fail')
+alert_count = sum(1 for x in pdf_data if x['status'] == 'alert')
+japanese_count = sum(1 for x in pdf_data if x['status'] == 'japanese')
+
+print(f"\nFinal status after all extractions:")
+print(f"  Success: {success_count}")
+print(f"  Alert: {alert_count}")
+print(f"  Fail: {fail_count}")
+print(f"  Japanese: {japanese_count}")
+
+
+# %%
 # Cell 10: Generate new filenames
 
 def generate_filename(authors: List[str], year: str, existing: set) -> Optional[str]:
@@ -2553,18 +2791,29 @@ for item in pdf_data:
             item['new_filename'] = None
             item['status'] = 'fail'
             item['fail_reason'] = 'filename_generation_failed'
-    elif item['status'] in ('fail', 'alert'):
-        # Skip filename generation for fail/alert - will be moved to failure/ directory
+    elif item['status'] == 'alert':
+        # Alert: generate filename and move to alert/ directory for human review
+        new_name = generate_filename(item['final_authors'], item['final_year'], existing)
+        if new_name:
+            item['new_filename'] = new_name
+            existing.add(new_name.lower())
+        else:
+            item['new_filename'] = None
+        item['move_to_alert'] = True
+    elif item['status'] == 'fail':
+        # Fail: no filename, move to failure/ directory
         item['new_filename'] = None
         item['move_to_failure'] = True
     # Japanese files keep their original name and move to japanese/
 
 success_count = sum(1 for x in pdf_data if x['status'] == 'success' and x.get('new_filename'))
+alert_count = sum(1 for x in pdf_data if x.get('move_to_alert'))
 failure_count = sum(1 for x in pdf_data if x.get('move_to_failure'))
 japanese_count = sum(1 for x in pdf_data if x['status'] == 'japanese')
 
 print(f"Filename generation complete.")
 print(f"  Files to rename: {success_count}")
+print(f"  Files to move to alert/: {alert_count}")
 print(f"  Files to move to failure/: {failure_count}")
 print(f"  Files to move to japanese/: {japanese_count}")
 
@@ -2610,8 +2859,9 @@ if EXECUTE_RENAME:
     # Create folders if needed
     japanese_dir = os.path.join(ARTICLES_DIR, 'japanese')
     research_dir = os.path.join(ARTICLES_DIR, 're-search')
+    alert_dir = os.path.join(ARTICLES_DIR, 'alert')
     failure_dir = os.path.join(ARTICLES_DIR, 'failure')
-    for folder in [japanese_dir, research_dir, failure_dir]:
+    for folder in [japanese_dir, research_dir, alert_dir, failure_dir]:
         if not os.path.exists(folder):
             os.makedirs(folder)
             print(f"Created directory: {folder}")
@@ -2619,6 +2869,7 @@ if EXECUTE_RENAME:
     renamed = []
     moved_japanese = []
     moved_research = []
+    moved_alert = []
     moved_failure = []
     errors = []
 
@@ -2643,14 +2894,30 @@ if EXECUTE_RENAME:
                 errors.append({'old': old_name, 'new': f'japanese/{old_name}', 'reason': str(e)})
             continue
 
-        # Handle fail/alert papers - move to failure folder (for manual review)
+        # Handle alert papers - rename and move to alert folder (for human review)
+        if item.get('move_to_alert'):
+            new_name = item.get('new_filename') or old_name
+            new_path = os.path.join(alert_dir, new_name)
+            try:
+                if not os.path.exists(new_path):
+                    os.rename(old_path, new_path)
+                    moved_alert.append({'old': old_name, 'new': f'alert/{new_name}',
+                                       'alert_reason': item.get('alert_reason'),
+                                       'authors': item.get('final_authors')})
+                else:
+                    errors.append({'old': old_name, 'new': f'alert/{new_name}', 'reason': 'path conflict'})
+            except Exception as e:
+                errors.append({'old': old_name, 'new': f'alert/{new_name}', 'reason': str(e)})
+            continue
+
+        # Handle fail papers - move to failure folder (no rename)
         if item.get('move_to_failure'):
             new_path = os.path.join(failure_dir, old_name)
             try:
                 if not os.path.exists(new_path):
                     os.rename(old_path, new_path)
                     moved_failure.append({'old': old_name, 'new': f'failure/{old_name}',
-                                         'status': item['status'], 'reason': item.get('fail_reason')})
+                                         'fail_reason': item.get('fail_reason')})
                 else:
                     errors.append({'old': old_name, 'new': f'failure/{old_name}', 'reason': 'path conflict'})
             except Exception as e:
@@ -2691,15 +2958,24 @@ if EXECUTE_RENAME:
     print(f"\nRename complete:")
     print(f"  Renamed: {len(renamed)}")
     print(f"  Moved to japanese/: {len(moved_japanese)}")
+    print(f"  Moved to alert/: {len(moved_alert)}")
     print(f"  Moved to failure/: {len(moved_failure)}")
     print(f"  Moved to re-search/: {len(moved_research)}")
     print(f"  Errors: {len(errors)}")
+
+    # Show alert details
+    if moved_alert:
+        print(f"\n--- Alert files (require human review) ---")
+        for item in moved_alert[:20]:
+            print(f"  {item['old']} -> {item['new']}")
+            print(f"    Reason: {item.get('alert_reason')}, Authors: {item.get('authors')}")
 
     # Save results
     with open(os.path.join(ARTICLES_DIR, 'rename_results_final.json'), 'w') as f:
         json.dump({
             'renamed': renamed,
             'moved_japanese': moved_japanese,
+            'moved_alert': moved_alert,
             'moved_failure': moved_failure,
             'moved_research': moved_research,
             'errors': errors,
