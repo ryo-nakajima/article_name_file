@@ -32,6 +32,7 @@ import json
 import time
 import shutil
 import subprocess
+import hashlib
 import pypdf
 import pdfplumber
 import pytesseract
@@ -46,6 +47,119 @@ warnings.filterwarnings('ignore')
 # Suppress PDF parsing warnings
 logging.getLogger('pypdf').setLevel(logging.ERROR)
 logging.getLogger('pdfminer').setLevel(logging.ERROR)
+
+# === Incremental Processing Support ===
+PROGRESS_FILE = 'pdf_processing_progress.json'
+SAVE_INTERVAL = 50  # Save progress every N files
+
+
+def calculate_file_hash(file_path: str, chunk_size: int = 8192) -> str:
+    """Calculate MD5 hash of a file for identification."""
+    hasher = hashlib.md5()
+    try:
+        with open(file_path, 'rb') as f:
+            while chunk := f.read(chunk_size):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception:
+        return ""
+
+
+def load_progress() -> Dict:
+    """
+    Load existing progress from file.
+    Returns dict with structure:
+    {
+        'by_hash': {hash: {data}},  # Main lookup by file hash
+        'hash_to_filename': {hash: filename},  # For display purposes
+        'last_updated': timestamp
+    }
+    """
+    progress_path = os.path.join(ARTICLES_DIR, PROGRESS_FILE)
+    if os.path.exists(progress_path):
+        try:
+            with open(progress_path, 'r') as f:
+                data = json.load(f)
+                # Ensure required keys exist
+                if 'by_hash' not in data:
+                    data['by_hash'] = {}
+                if 'hash_to_filename' not in data:
+                    data['hash_to_filename'] = {}
+                return data
+        except Exception as e:
+            print(f"Warning: Could not load progress file: {e}")
+    return {'by_hash': {}, 'hash_to_filename': {}, 'last_updated': None}
+
+
+def save_progress(progress: Dict):
+    """Save progress to file."""
+    progress_path = os.path.join(ARTICLES_DIR, PROGRESS_FILE)
+    progress['last_updated'] = datetime.now().isoformat()
+    try:
+        with open(progress_path, 'w') as f:
+            json.dump(progress, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save progress: {e}")
+
+
+def cleanup_deleted_files(progress: Dict, current_hashes: set) -> int:
+    """
+    Remove entries for files that no longer exist.
+    Returns number of entries removed.
+    """
+    deleted_count = 0
+    hashes_to_remove = []
+
+    for file_hash in progress['by_hash']:
+        if file_hash not in current_hashes:
+            hashes_to_remove.append(file_hash)
+
+    for file_hash in hashes_to_remove:
+        del progress['by_hash'][file_hash]
+        if file_hash in progress['hash_to_filename']:
+            del progress['hash_to_filename'][file_hash]
+        deleted_count += 1
+
+    return deleted_count
+
+
+def should_process_extraction(progress: Dict, file_hash: str) -> bool:
+    """Check if file needs extraction (new or previously failed)."""
+    if file_hash not in progress['by_hash']:
+        return True  # New file
+
+    entry = progress['by_hash'][file_hash]
+    status = entry.get('status', '')
+
+    # Re-process if extraction failed or never completed
+    if status in ('extraction_failed', 'pending', ''):
+        return True
+
+    # Skip if extraction was successful (has title or marked as japanese/no_title)
+    return False
+
+
+def should_process_websearch(progress: Dict, file_hash: str) -> bool:
+    """Check if file needs WebSearch (extracted but not searched)."""
+    if file_hash not in progress['by_hash']:
+        return False  # Can't search without extraction
+
+    entry = progress['by_hash'][file_hash]
+
+    # Skip Japanese files
+    if entry.get('status') == 'japanese':
+        return False
+
+    # Skip if no title extracted
+    if not entry.get('title'):
+        return False
+
+    # Process if websearch not done or failed
+    websearch_status = entry.get('websearch_status', '')
+    if websearch_status in ('done', 'not_found'):
+        return False  # Already searched
+
+    return True
 
 # Check and install system dependencies (poppler, tesseract)
 def check_and_install_dependencies():
@@ -186,6 +300,27 @@ NON_SURNAMES = {
     'nicole', 'helen', 'samantha', 'katherine', 'christine', 'debra', 'rachel',
     'carolyn', 'janet', 'catherine', 'maria', 'heather', 'diane', 'ruth', 'julie',
     'olivia', 'joyce', 'virginia', 'victoria', 'kelly', 'lauren', 'christina',
+
+    # International first names (European, Russian, etc.)
+    'dmitry', 'guido', 'birte', 'pedro', 'pablo', 'miguel', 'jose', 'carlos', 'juan',
+    'marco', 'luigi', 'giuseppe', 'francesco', 'antonio', 'hans', 'fritz', 'klaus',
+    'wolfgang', 'heinrich', 'helmut', 'stefan', 'andreas', 'matthias', 'christoph',
+    'pierre', 'jean', 'francois', 'jacques', 'philippe', 'michel', 'olivier', 'yves',
+    'ivan', 'sergei', 'sergey', 'vladimir', 'nikolai', 'alexei', 'andrei', 'yuri',
+    'boris', 'viktor', 'oleg', 'maxim', 'igor', 'pavel', 'konstantin', 'artem',
+    'alyssa', 'timothy', 'jonathan', 'richard', 'rafael', 'xavier', 'fernando',
+
+    # More affiliation/institution words
+    'administration', 'administrative', 'administrator', 'administrators', 'faculty',
+    'professor', 'assistant', 'associate', 'graduate', 'undergraduate', 'postgraduate',
+    'doctoral', 'postdoc', 'postdoctoral', 'fellow', 'fellows', 'fellowship', 'center',
+    'centre', 'laboratory', 'lab', 'group', 'division', 'unit', 'program', 'programme',
+    'speyer', 'germany', 'france', 'italy', 'spain', 'switzerland', 'austria', 'belgium',
+    'neurology', 'medicine', 'medical', 'clinical', 'hospital', 'clinic',
+
+    # Title words that should not be surnames
+    'uncertainty', 'herding', 'bias', 'citation', 'citationbias', 'anchoring',
+    'influence', 'expert', 'opinion', 'correlation', 'causation', 'inference',
 }
 
 print(f"NON_SURNAMES list contains {len(NON_SURNAMES)} words")
@@ -198,28 +333,51 @@ def is_valid_surname(name: str) -> bool:
     """Check if a name looks like a valid surname."""
     if not name:
         return False
-    
+
     name = name.strip()
     name = re.sub(r'[:\.,;!?]+$', '', name)
-    
+
     if len(name) < 2 or len(name) > 20:
         return False
-    
+
     if name.lower() in NON_SURNAMES:
         return False
-    
+
     if any(c.isdigit() for c in name):
         return False
-    
+
     letters = sum(1 for c in name if c.isalpha())
     if letters < len(name) * 0.8:
         return False
-    
+
     # Reject words ending with common suffixes
     if re.search(r'(ing|tion|ment|ness|ity|ous|ive|able|ible|ence|ance|ology|ics)$', name.lower()):
         if len(name) > 8:
             return False
-    
+
+    # Reject garbled/truncated names: unusual starting consonant clusters
+    # Be careful not to reject valid African/Asian names like "Ng", "Ndegwa"
+    lower_name = name.lower()
+    if len(lower_name) >= 3:
+        # Check for clearly invalid 3+ consonant clusters at start
+        invalid_starts = ['ndf', 'xzx', 'zxz', 'qxq', 'vbv', 'bvb', 'kmt', 'pmt', 'bnt', 'dnt', 'fnt', 'gnt', 'hnt', 'lnt', 'mnt', 'pnt', 'rnt', 'tnt', 'wnt', 'znt']
+        for inv in invalid_starts:
+            if lower_name.startswith(inv):
+                return False
+        # Also reject if starts with more than 3 consonants in a row
+        if re.match(r'^[bcdfghjklmnpqrstvwxz]{4,}', lower_name):
+            return False
+
+    # Check minimum vowel ratio for longer names (names need vowels!)
+    if len(lower_name) >= 5:
+        vowels = sum(1 for c in lower_name if c in 'aeiou')
+        if vowels < len(lower_name) * 0.15:  # Less than 15% vowels is suspicious
+            return False
+
+    # Reject if starts with lowercase (after stripping)
+    if name and name[0].islower():
+        return False
+
     return True
 
 
@@ -483,6 +641,47 @@ def find_title_by_font_and_position(page) -> Optional[str]:
     return candidates[0]['text'] if candidates else None
 
 
+def call_gpt_with_retry(messages: list, max_tokens: int = 10,
+                        max_retries: int = 3, base_delay: float = 10.0):
+    """
+    Call GPT API with retry logic for rate limit errors.
+
+    Args:
+        messages: Chat messages to send
+        max_tokens: Maximum tokens in response
+        max_retries: Maximum retry attempts
+        base_delay: Base delay between retries (doubles each retry)
+
+    Returns:
+        Response object or None if all retries failed
+    """
+    for attempt in range(max_retries):
+        try:
+            response = openai_client.chat.completions.create(
+                model=GPT_MODEL,
+                messages=messages,
+                temperature=0,
+                max_tokens=max_tokens
+            )
+            return response
+        except Exception as e:
+            error_str = str(e)
+            # Check for rate limit error (429)
+            if '429' in error_str or 'rate_limit' in error_str.lower():
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # 10s, 20s, 40s
+                    print(f"  GPT rate limit hit, waiting {delay}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                else:
+                    print(f"  GPT rate limit: giving up after {max_retries} retries")
+                    return None
+            else:
+                # Other errors, don't retry
+                print(f"  GPT error: {e}")
+                return None
+    return None
+
+
 def validate_title_with_gpt(candidate: str, pdf_text: str, max_text_chars: int = 2000) -> bool:
     """
     Use GPT to validate if a candidate string is likely the paper title.
@@ -500,13 +699,10 @@ def validate_title_with_gpt(candidate: str, pdf_text: str, max_text_chars: int =
 
     truncated_text = pdf_text[:max_text_chars] if pdf_text else ""
 
-    try:
-        response = openai_client.chat.completions.create(
-            model=GPT_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": """You are an expert at identifying academic paper titles.
+    messages = [
+        {
+            "role": "system",
+            "content": """You are an expert at identifying academic paper titles.
 Given a candidate title and the beginning of a PDF, determine if the candidate is the actual paper title.
 
 Rules:
@@ -517,22 +713,21 @@ Rules:
 - They should NOT be metadata (volume, issue, DOI, dates)
 
 Respond with ONLY "YES" or "NO"."""
-                },
-                {
-                    "role": "user",
-                    "content": f"Candidate title: \"{candidate}\"\n\nPDF text context:\n{truncated_text}\n\nIs this the paper title?"
-                }
-            ],
-            temperature=0,
-            max_tokens=10
-        )
+        },
+        {
+            "role": "user",
+            "content": f"Candidate title: \"{candidate}\"\n\nPDF text context:\n{truncated_text}\n\nIs this the paper title?"
+        }
+    ]
 
+    response = call_gpt_with_retry(messages)
+
+    if response:
         result = response.choices[0].message.content.strip().upper()
         return result == "YES"
-
-    except Exception as e:
-        print(f"GPT title validation error: {e}")
-        return True  # On error, accept the candidate
+    else:
+        # On error, accept the candidate (fallback)
+        return True
 
 
 def find_title_with_gpt_validation(page, pdf_text: str, use_gpt: bool = True) -> Optional[str]:
@@ -960,13 +1155,10 @@ def extract_title_with_gpt(text: str, max_chars: int = 3000) -> Optional[str]:
     # Truncate text to control costs
     truncated_text = text[:max_chars]
 
-    try:
-        response = openai_client.chat.completions.create(
-            model=GPT_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": """You are an expert at identifying academic paper titles.
+    messages = [
+        {
+            "role": "system",
+            "content": """You are an expert at identifying academic paper titles.
 Given the beginning text of a PDF, extract ONLY the paper title.
 Rules:
 - Return ONLY the title, nothing else
@@ -974,30 +1166,28 @@ Rules:
 - Do NOT include author names, journal names, volume/issue numbers, or dates
 - If you cannot find a clear title, return "NONE"
 - Return the title exactly as written (preserve capitalization)"""
-                },
-                {
-                    "role": "user",
-                    "content": f"Extract the paper title from this text:\n\n{truncated_text}"
-                }
-            ],
-            temperature=0,
-            max_tokens=200
-        )
+        },
+        {
+            "role": "user",
+            "content": f"Extract the paper title from this text:\n\n{truncated_text}"
+        }
+    ]
 
-        title = response.choices[0].message.content.strip()
+    response = call_gpt_with_retry(messages, max_tokens=200)
 
-        if title == "NONE" or len(title) < 10:
-            return None
-
-        # Clean up the title
-        title = re.sub(r'^["\'"]|["\'"]$', '', title)  # Remove quotes
-        title = re.sub(r'[\d\*†‡§¶]+$', '', title).strip()
-
-        return title if len(title) >= 15 else None
-
-    except Exception as e:
-        print(f"GPT title extraction error: {e}")
+    if not response:
         return None
+
+    title = response.choices[0].message.content.strip()
+
+    if title == "NONE" or len(title) < 10:
+        return None
+
+    # Clean up the title
+    title = re.sub(r'^["\'"]|["\'"]$', '', title)  # Remove quotes
+    title = re.sub(r'[\d\*†‡§¶]+$', '', title).strip()
+
+    return title if len(title) >= 15 else None
 
 
 def validate_surnames_with_gpt(names: List[str]) -> List[str]:
@@ -1019,15 +1209,12 @@ def validate_surnames_with_gpt(names: List[str]) -> List[str]:
     if not filtered:
         return []
 
-    try:
-        names_str = ", ".join(filtered)
+    names_str = ", ".join(filtered)
 
-        response = openai_client.chat.completions.create(
-            model=GPT_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": """You are an expert at identifying valid academic author surnames.
+    messages = [
+        {
+            "role": "system",
+            "content": """You are an expert at identifying valid academic author surnames.
 Given a list of potential surnames, return ONLY the ones that are plausible human surnames.
 
 Rules:
@@ -1045,39 +1232,38 @@ Output: "Smith, Chen"
 
 Input: "The, And, Review, Markets"
 Output: "NONE" """
-                },
-                {
-                    "role": "user",
-                    "content": f"Validate these potential surnames: {names_str}"
-                }
-            ],
-            temperature=0,
-            max_tokens=200
-        )
+        },
+        {
+            "role": "user",
+            "content": f"Validate these potential surnames: {names_str}"
+        }
+    ]
 
-        result = response.choices[0].message.content.strip()
+    response = call_gpt_with_retry(messages, max_tokens=200)
 
-        if result == "NONE":
-            return []
-
-        # Parse the comma-separated result
-        validated = [n.strip() for n in result.split(",") if n.strip()]
-
-        # Normalize case
-        validated = [normalize_case(n) for n in validated if n]
-        validated = [n for n in validated if n]
-
-        return validated
-
-    except Exception as e:
-        print(f"GPT surname validation error: {e}")
+    if not response:
         return names  # Return original list on error
+
+    result = response.choices[0].message.content.strip()
+
+    if result == "NONE":
+        return []
+
+    # Parse the comma-separated result
+    validated = [n.strip() for n in result.split(",") if n.strip()]
+
+    # Normalize case
+    validated = [normalize_case(n) for n in validated if n]
+    validated = [n for n in validated if n]
+
+    return validated
 
 
 def get_title_and_authors_with_gpt(text: str, max_chars: int = 4000) -> Tuple[Optional[str], List[str], Optional[str]]:
     """
     Use GPT to extract both title and authors from PDF text in a single call.
     More efficient than separate calls when both are needed.
+    Includes retry logic for rate limit errors.
 
     Args:
         text: The first portion of PDF text
@@ -1090,13 +1276,10 @@ def get_title_and_authors_with_gpt(text: str, max_chars: int = 4000) -> Tuple[Op
 
     truncated_text = text[:max_chars]
 
-    try:
-        response = openai_client.chat.completions.create(
-            model=GPT_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": """You are an expert at extracting metadata from academic papers.
+    messages = [
+        {
+            "role": "system",
+            "content": """You are an expert at extracting metadata from academic papers.
 Given the beginning text of a PDF, extract:
 1. Paper title
 2. Author surnames (last names only)
@@ -1111,41 +1294,151 @@ Rules:
 - Year: The publication year, usually 4 digits (1990-2026)
 - If any field is not found, use null
 - For authors, return empty array [] if none found"""
-                },
-                {
-                    "role": "user",
-                    "content": f"Extract metadata from this paper:\n\n{truncated_text}"
-                }
-            ],
-            temperature=0,
-            max_tokens=300,
-            response_format={"type": "json_object"}
-        )
+        },
+        {
+            "role": "user",
+            "content": f"Extract metadata from this paper:\n\n{truncated_text}"
+        }
+    ]
 
-        result = json.loads(response.choices[0].message.content)
+    # Retry logic for rate limits
+    max_retries = 3
+    base_delay = 10.0
 
-        title = result.get("title")
-        if title and len(title) < 15:
-            title = None
+    for attempt in range(max_retries):
+        try:
+            response = openai_client.chat.completions.create(
+                model=GPT_MODEL,
+                messages=messages,
+                temperature=0,
+                max_tokens=300,
+                response_format={"type": "json_object"}
+            )
 
-        authors = result.get("authors", [])
-        if isinstance(authors, list):
-            authors = [normalize_case(a) for a in authors if a and isinstance(a, str)]
-            authors = [a for a in authors if a and is_valid_surname(a)]
-        else:
-            authors = []
+            result = json.loads(response.choices[0].message.content)
 
-        year = result.get("year")
-        if year:
-            year = str(year)
-            if not re.match(r'^(19[6-9]\d|20[0-2]\d)$', year):
-                year = None
+            title = result.get("title")
+            if title and len(title) < 15:
+                title = None
 
-        return title, authors, year
+            authors = result.get("authors", [])
+            if isinstance(authors, list):
+                authors = [normalize_case(a) for a in authors if a and isinstance(a, str)]
+                authors = [a for a in authors if a and is_valid_surname(a)]
+            else:
+                authors = []
 
-    except Exception as e:
-        print(f"GPT metadata extraction error: {e}")
-        return None, [], None
+            year = result.get("year")
+            if year:
+                year = str(year)
+                if not re.match(r'^(19[6-9]\d|20[0-2]\d)$', year):
+                    year = None
+
+            return title, authors, year
+
+        except Exception as e:
+            error_str = str(e)
+            if '429' in error_str or 'rate_limit' in error_str.lower():
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    print(f"  GPT rate limit hit, waiting {delay}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                else:
+                    print(f"  GPT rate limit: giving up after {max_retries} retries")
+                    return None, [], None
+            else:
+                print(f"GPT metadata extraction error: {e}")
+                return None, [], None
+
+    return None, [], None
+
+
+def validate_surnames_with_gpt(surnames: List[str], title: str = None) -> Tuple[List[str], bool]:
+    """
+    Use GPT to validate if extracted names are valid surnames.
+
+    Args:
+        surnames: List of potential surnames to validate
+        title: Optional paper title for context
+
+    Returns:
+        (validated_surnames, all_valid): List of valid surnames and whether all passed
+    """
+    if not surnames:
+        return [], True
+
+    # Build context
+    context = f"Paper title: {title}\n" if title else ""
+    context += f"Potential surnames: {', '.join(surnames)}"
+
+    messages = [
+        {
+            "role": "system",
+            "content": """You are validating and correcting author surnames for academic papers.
+Return JSON: {"valid_surnames": ["Corrected1", "Corrected2"], "invalid": ["Original1"], "reason": "explanation"}
+
+IMPORTANT: Return CORRECTED surnames in valid_surnames, not the original invalid ones.
+
+Rules:
+- Valid surnames are family/last names (e.g., "Smith", "Arkhangelsky", "DeStefano", "O'Brien")
+- CORRECT concatenated names: "JonathanRoth" → return "Roth" in valid_surnames
+- CORRECT concatenated names: "JonathanRotha" → return "Roth" in valid_surnames (remove trailing 'a')
+- REJECT first names with no surname: "Jonathan" alone → invalid, return []
+- REJECT title words: "Uncertainty", "Herding", "Citation" → invalid
+- REJECT garbled text: "Ndfirm", "Enough" → invalid (unless you can identify the real surname)
+- REJECT institution words: "Administrator", "University" → invalid
+
+Examples:
+- Input: ["JonathanRotha"] → {"valid_surnames": ["Roth"], "invalid": ["JonathanRotha"], "reason": "extracted surname from concatenated name"}
+- Input: ["Smith", "Enough"] → {"valid_surnames": ["Smith"], "invalid": ["Enough"], "reason": "Enough is not a valid surname"}
+- Input: ["Dmitry", "Guido"] → {"valid_surnames": [], "invalid": ["Dmitry", "Guido"], "reason": "these are first names, not surnames"}"""
+        },
+        {
+            "role": "user",
+            "content": context
+        }
+    ]
+
+    max_retries = 3
+    base_delay = 10.0
+
+    for attempt in range(max_retries):
+        try:
+            response = openai_client.chat.completions.create(
+                model=GPT_MODEL,
+                messages=messages,
+                temperature=0,
+                max_tokens=200,
+                response_format={"type": "json_object"}
+            )
+
+            result = json.loads(response.choices[0].message.content)
+            valid = result.get("valid_surnames", [])
+            invalid = result.get("invalid", [])
+
+            # Normalize and filter
+            valid = [normalize_case(s) for s in valid if s and isinstance(s, str)]
+            valid = [s for s in valid if s and is_valid_surname(s)]
+
+            all_valid = len(invalid) == 0 and len(valid) == len(surnames)
+
+            return valid, all_valid
+
+        except Exception as e:
+            error_str = str(e)
+            if '429' in error_str or 'rate_limit' in error_str.lower():
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    print(f"  GPT rate limit hit, waiting {delay}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                else:
+                    # On rate limit failure, return original with warning
+                    return surnames, False
+            else:
+                print(f"GPT surname validation error: {e}")
+                return surnames, False
+
+    return surnames, False
 
 
 print("GPT functions defined.")
@@ -1161,10 +1454,17 @@ ORCID_PATTERN = r'[\U0001F194]|orcid\.org|ORCID'
 
 def clean_author_markers(text: str) -> str:
     """Remove superscript markers, ORCID icons, and other annotations from author text."""
-    # Remove superscript numbers and letters
+    # Remove superscript numbers and letters (Unicode)
     text = re.sub(r'[¹²³⁴⁵⁶⁷⁸⁹⁰ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ]+', '', text)
     # Remove common markers
     text = re.sub(r'[*†‡§¶∗⁺]+', '', text)
+    # Remove single-letter superscript markers (a, b, c, 1, 2 etc.) that appear after names
+    # Pattern: space + single letter/digit + (comma/end/asterisk/space)
+    # e.g., "Roth a,*" -> "Roth", "Smith b " -> "Smith"
+    text = re.sub(r'\s+[a-z]\s*[,;*†‡]', '', text)  # "Roth a," -> "Roth"
+    text = re.sub(r'\s+[a-z]\s*$', '', text)  # "Roth a" at end -> "Roth"
+    text = re.sub(r'\s+\d\s*[,;*†‡]', '', text)  # "Roth 1," -> "Roth"
+    text = re.sub(r'\s+\d\s*$', '', text)  # "Roth 1" at end -> "Roth"
     # Remove ORCID references
     text = re.sub(r'\s*\([^)]*orcid[^)]*\)', '', text, flags=re.IGNORECASE)
     # Remove standalone special chars
@@ -1222,8 +1522,12 @@ def parse_author_line(line: str) -> List[str]:
         if not part:
             continue
 
-        # Skip if it looks like an affiliation (contains university/institution keywords)
-        if re.search(r'\b(university|college|institute|school|department|dept)\b', part, re.IGNORECASE):
+        # Skip if it looks like an affiliation (contains institution keywords)
+        affiliation_pattern = r'\b(university|college|institute|school|department|dept|faculty|' \
+                             r'administration|administrative|center|centre|laboratory|lab|' \
+                             r'research|professor|assistant|associate|fellow|graduate|doctoral|' \
+                             r'hospital|clinic|medical|sciences|neurology|medicine)\b'
+        if re.search(affiliation_pattern, part, re.IGNORECASE):
             continue
 
         surname = extract_surname_from_name(part)
@@ -1640,9 +1944,44 @@ print("PDF text search functions defined.")
 import requests
 
 
+def request_with_retry(url: str, params: dict = None, headers: dict = None,
+                       timeout: int = 15, max_retries: int = 3,
+                       base_delay: float = 2.0) -> Optional[requests.Response]:
+    """
+    Make HTTP GET request with exponential backoff retry.
+
+    Args:
+        url: Request URL
+        params: Query parameters
+        headers: Request headers
+        timeout: Request timeout in seconds
+        max_retries: Maximum retry attempts
+        base_delay: Base delay between retries (doubles each retry)
+
+    Returns:
+        Response object or None if all retries failed
+    """
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=timeout)
+            return response
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)  # Exponential backoff: 2s, 4s, 8s
+                print(f"  Retry {attempt + 1}/{max_retries} after {delay}s... ({type(e).__name__})")
+                time.sleep(delay)
+            else:
+                print(f"  Request failed after {max_retries} retries: {e}")
+                return None
+        except Exception as e:
+            print(f"  Request error: {e}")
+            return None
+    return None
+
+
 def search_semantic_scholar(title: str, clean_title: str) -> Tuple[List[str], Optional[str], str]:
     """
-    Search Semantic Scholar API.
+    Search Semantic Scholar API with retry logic.
     Returns: (authors, year, source)
     """
     try:
@@ -1655,9 +1994,9 @@ def search_semantic_scholar(title: str, clean_title: str) -> Tuple[List[str], Op
             "limit": 5
         }
 
-        response = requests.get(url, params=params, timeout=10)
+        response = request_with_retry(url, params=params, timeout=15, max_retries=3)
 
-        if response.status_code == 200:
+        if response and response.status_code == 200:
             data = response.json()
             if data.get('data'):
                 for paper in data['data']:
@@ -1684,7 +2023,7 @@ def search_semantic_scholar(title: str, clean_title: str) -> Tuple[List[str], Op
 
 def search_crossref(title: str, clean_title: str) -> Tuple[List[str], Optional[str], str]:
     """
-    Search CrossRef API (fallback).
+    Search CrossRef API (fallback) with retry logic.
     Returns: (authors, year, source)
     """
     try:
@@ -1699,9 +2038,9 @@ def search_crossref(title: str, clean_title: str) -> Tuple[List[str], Optional[s
             "User-Agent": "PDFRenamer/1.0 (mailto:your-email@example.com)"  # CrossRef asks for this
         }
 
-        response = requests.get(url, params=params, headers=headers, timeout=15)
+        response = request_with_retry(url, params=params, headers=headers, timeout=20, max_retries=3)
 
-        if response.status_code == 200:
+        if response and response.status_code == 200:
             data = response.json()
             items = data.get('message', {}).get('items', [])
             for item in items:
@@ -1768,26 +2107,61 @@ def websearch_authors(title: str) -> Tuple[List[str], Optional[str], str]:
 print("WebSearch functions defined. Using Semantic Scholar + CrossRef fallback.")
 
 # %%
-# Cell 6: Step 1 - Extract titles and metadata from all PDFs
-# Japanese PDFs are detected here and marked for moving (skipped in WebSearch)
+# Cell 6: Step 1 - Extract titles and metadata from PDFs (INCREMENTAL)
+# - Loads existing progress and skips already processed files
+# - Uses file hash for identification (survives renames)
+# - Re-processes failed files
+# - Removes entries for deleted files
 
 print(f"Starting extraction at {datetime.now()}")
 
+# Load existing progress
+progress = load_progress()
+print(f"Loaded progress: {len(progress['by_hash'])} files previously processed")
+
+# Get current PDF files and calculate hashes
 pdf_files = [f for f in os.listdir(ARTICLES_DIR) if f.lower().endswith('.pdf')]
-print(f"Found {len(pdf_files)} PDFs")
+print(f"Found {len(pdf_files)} PDFs in directory")
 
-pdf_data = []
+# Build hash map for current files
+print("Calculating file hashes...")
+current_files = {}  # hash -> filename
+for filename in pdf_files:
+    path = os.path.join(ARTICLES_DIR, filename)
+    file_hash = calculate_file_hash(path)
+    if file_hash:
+        current_files[file_hash] = filename
 
-for i, filename in enumerate(sorted(pdf_files)):
+current_hashes = set(current_files.keys())
+
+# Clean up deleted files
+deleted_count = cleanup_deleted_files(progress, current_hashes)
+if deleted_count > 0:
+    print(f"Removed {deleted_count} entries for deleted files")
+    save_progress(progress)
+
+# Determine which files need processing
+to_process = []
+for file_hash, filename in current_files.items():
+    if should_process_extraction(progress, file_hash):
+        to_process.append((file_hash, filename))
+
+skipped_count = len(current_files) - len(to_process)
+print(f"Files to process: {len(to_process)} (skipping {skipped_count} already processed)")
+
+# Process new/failed files
+processed_count = 0
+for i, (file_hash, filename) in enumerate(to_process):
     if (i + 1) % 100 == 0:
-        print(f"Extracting {i+1}/{len(pdf_files)}...")
+        print(f"Extracting {i+1}/{len(to_process)}...")
 
     path = os.path.join(ARTICLES_DIR, filename)
 
     # Check for Japanese PDF first
     if is_japanese_pdf(path):
-        pdf_data.append({
+        entry = {
             'filename': filename,
+            'file_hash': file_hash,
             'title': None,
             'title_method': 'none',
             'title_error': 'japanese',
@@ -1796,40 +2170,58 @@ for i, filename in enumerate(sorted(pdf_files)):
             'websearch_authors': None,
             'websearch_year': None,
             'websearch_source': None,
+            'websearch_status': None,
             'final_authors': None,
             'final_year': None,
             'status': 'japanese',
-            'fail_reason': 'japanese'
-        })
-        continue
+            'fail_reason': 'japanese',
+            'extracted_at': datetime.now().isoformat()
+        }
+    else:
+        title, method, error = extract_title_from_pdf(path)
+        meta_authors, meta_year = extract_metadata(path)
 
-    title, method, error = extract_title_from_pdf(path)
-    meta_authors, meta_year = extract_metadata(path)
+        entry = {
+            'filename': filename,
+            'file_hash': file_hash,
+            'title': title,
+            'title_method': method,
+            'title_error': error,
+            'meta_authors': meta_authors,
+            'meta_year': meta_year,
+            'websearch_authors': None,
+            'websearch_year': None,
+            'websearch_source': None,
+            'websearch_status': None,
+            'final_authors': None,
+            'final_year': None,
+            'status': 'extracted' if title else 'extraction_failed',
+            'extracted_at': datetime.now().isoformat()
+        }
 
-    pdf_data.append({
-        'filename': filename,
-        'title': title,
-        'title_method': method,  # 'text', 'text_gpt', 'ocr', 'ocr_gpt', or 'none'
-        'title_error': error,    # error type if failed
-        'meta_authors': meta_authors,
-        'meta_year': meta_year,
-        'websearch_authors': None,
-        'websearch_year': None,
-        'websearch_source': None,
-        'final_authors': None,
-        'final_year': None,
-        'status': 'pending'
-    })
+    # Store in progress
+    progress['by_hash'][file_hash] = entry
+    progress['hash_to_filename'][file_hash] = filename
+    processed_count += 1
+
+    # Save periodically
+    if processed_count % SAVE_INTERVAL == 0:
+        save_progress(progress)
+        print(f"Progress saved at {processed_count}")
+
+# Final save
+save_progress(progress)
+
+# Build pdf_data list from progress for subsequent cells
+pdf_data = list(progress['by_hash'].values())
 
 # Summary statistics
+total_count = len(pdf_data)
 japanese_count = sum(1 for x in pdf_data if x['status'] == 'japanese')
 title_count = sum(1 for x in pdf_data if x['title'])
-# Count text extraction (includes 'text' and 'text_gpt')
 text_count = sum(1 for x in pdf_data if x.get('title_method', '').startswith('text'))
-# Count OCR extraction (includes 'ocr' and 'ocr_gpt')
 ocr_count = sum(1 for x in pdf_data if x.get('title_method', '').startswith('ocr'))
 
-# Count extraction errors
 error_counts = {}
 for x in pdf_data:
     err = x.get('title_error')
@@ -1837,12 +2229,15 @@ for x in pdf_data:
         error_counts[err] = error_counts.get(err, 0) + 1
 
 print(f"\nExtraction complete.")
+print(f"Total files in progress: {total_count}")
+print(f"  - Newly processed: {processed_count}")
+print(f"  - Skipped (already done): {skipped_count}")
 print(f"Japanese PDFs (will be moved): {japanese_count}")
 print(f"PDFs with title: {title_count}")
 print(f"  - From text extraction: {text_count}")
 print(f"  - From OCR: {ocr_count}")
-print(f"PDFs with metadata authors: {sum(1 for x in pdf_data if x['meta_authors'])}")
-print(f"PDFs with metadata year: {sum(1 for x in pdf_data if x['meta_year'])}")
+print(f"PDFs with metadata authors: {sum(1 for x in pdf_data if x.get('meta_authors'))}")
+print(f"PDFs with metadata year: {sum(1 for x in pdf_data if x.get('meta_year'))}")
 
 if error_counts:
     print(f"\nTitle extraction failures:")
@@ -1850,60 +2245,69 @@ if error_counts:
         print(f"  - {err}: {cnt}")
 
 # %%
-# Cell 7: Step 2 - WebSearch for all PDFs with titles
-# WARNING: This will take a long time for many files!
-# Adjust batch_size and add sleep for rate limiting
-# Note: Japanese PDFs are skipped (already marked in Cell 6)
+# Cell 7: Step 2 - WebSearch for PDFs with titles (INCREMENTAL)
+# - Skips files that already have WebSearch results
+# - Re-tries files where WebSearch previously failed
+# - Saves progress to the main progress file
 
-batch_size = 50  # Process in batches to save progress
-save_interval = 50  # Save progress every N files
-
-non_japanese = [x for x in pdf_data if x['status'] != 'japanese']
 print(f"Starting WebSearch at {datetime.now()}")
-print(f"Files to process: {sum(1 for x in non_japanese if x['title'])}")
-print(f"Skipping {sum(1 for x in pdf_data if x['status'] == 'japanese')} Japanese PDFs")
 
-for i, item in enumerate(pdf_data):
-    # Skip Japanese PDFs
-    if item['status'] == 'japanese':
-        continue
+# Determine which files need WebSearch
+to_search = []
+for file_hash, entry in progress['by_hash'].items():
+    if should_process_websearch(progress, file_hash):
+        to_search.append(file_hash)
 
-    if item['websearch_authors'] is not None:  # Skip already processed
-        continue
+already_searched = sum(1 for x in progress['by_hash'].values()
+                       if x.get('websearch_status') in ('done', 'not_found'))
+japanese_count = sum(1 for x in progress['by_hash'].values() if x.get('status') == 'japanese')
+no_title_count = sum(1 for x in progress['by_hash'].values()
+                     if x.get('status') != 'japanese' and not x.get('title'))
 
-    if not item['title']:
-        item['websearch_authors'] = []
-        item['websearch_year'] = None
-        item['websearch_source'] = None
-        continue
+print(f"Files to search: {len(to_search)}")
+print(f"Already searched: {already_searched}")
+print(f"Skipping: {japanese_count} Japanese, {no_title_count} no title")
+
+# Process WebSearch
+search_count = 0
+for i, file_hash in enumerate(to_search):
+    entry = progress['by_hash'][file_hash]
+
+    if (i + 1) % 10 == 0:
+        print(f"Searching {i+1}/{len(to_search)}... ({entry['filename'][:30]})")
 
     # Perform WebSearch (Semantic Scholar -> CrossRef fallback)
-    ws_authors, ws_year, ws_source = websearch_authors(item['title'])
-    item['websearch_authors'] = ws_authors
-    item['websearch_year'] = ws_year
-    item['websearch_source'] = ws_source if ws_source else None
-    
-    if (i + 1) % 10 == 0:
-        print(f"Processed {i+1}/{len(pdf_data)}...")
-    
+    ws_authors, ws_year, ws_source = websearch_authors(entry['title'])
+
+    entry['websearch_authors'] = ws_authors if ws_authors else []
+    entry['websearch_year'] = ws_year
+    entry['websearch_source'] = ws_source if ws_source else None
+    entry['websearch_status'] = 'done' if ws_authors else 'not_found'
+    entry['websearch_at'] = datetime.now().isoformat()
+
+    search_count += 1
+
     # Save progress periodically
-    if (i + 1) % save_interval == 0:
-        with open(os.path.join(ARTICLES_DIR, 'websearch_progress.json'), 'w') as f:
-            json.dump(pdf_data, f, ensure_ascii=False, indent=2)
-        print(f"Progress saved at {i+1}")
+    if search_count % SAVE_INTERVAL == 0:
+        save_progress(progress)
+        print(f"Progress saved at {search_count}")
 
 # Final save
-with open(os.path.join(ARTICLES_DIR, 'websearch_progress.json'), 'w') as f:
-    json.dump(pdf_data, f, ensure_ascii=False, indent=2)
+save_progress(progress)
+
+# Rebuild pdf_data from progress
+pdf_data = list(progress['by_hash'].values())
 
 # WebSearch statistics
 ws_success = sum(1 for x in pdf_data if x.get('websearch_authors'))
 ws_semantic = sum(1 for x in pdf_data if x.get('websearch_source') == 'semantic_scholar')
 ws_crossref = sum(1 for x in pdf_data if x.get('websearch_source') == 'crossref')
-ws_no_title = sum(1 for x in pdf_data if x['status'] != 'japanese' and not x['title'])
-ws_not_found = sum(1 for x in pdf_data if x['status'] != 'japanese' and x['title'] and not x.get('websearch_authors'))
+ws_no_title = sum(1 for x in pdf_data if x.get('status') != 'japanese' and not x.get('title'))
+ws_not_found = sum(1 for x in pdf_data if x.get('status') != 'japanese' and x.get('title')
+                   and not x.get('websearch_authors'))
 
 print(f"\nWebSearch complete at {datetime.now()}")
+print(f"  - Newly searched: {search_count}")
 print(f"Files with WebSearch results: {ws_success}")
 print(f"  - From Semantic Scholar: {ws_semantic}")
 print(f"  - From CrossRef: {ws_crossref}")
@@ -1913,20 +2317,41 @@ print(f"  - Title found but search failed: {ws_not_found}")
 
 # %%
 # Cell 8: Step 3 - Compare WebSearch results with metadata and determine final authors/year
+# Now includes GPT validation for WebSearch results to catch API errors (e.g., "Enough" instead of "Englich")
 
-print("Comparing WebSearch results with metadata...")
+print("Comparing WebSearch results with metadata (with GPT validation)...")
 
-for item in pdf_data:
+GPT_VALIDATE_WEBSEARCH = True  # Set to False to skip GPT validation (faster but less accurate)
+gpt_validated_count = 0
+gpt_corrected_count = 0
+
+for i, item in enumerate(pdf_data):
+    if (i + 1) % 100 == 0:
+        print(f"Processing {i+1}/{len(pdf_data)}...")
+
     filename = item['filename']
     ws_authors = item['websearch_authors'] or []
     ws_year = item['websearch_year']
     meta_authors = item['meta_authors'] or []
     meta_year = item['meta_year']
-    
-    # Filter valid surnames
+    title = item.get('title', '')
+
+    # Filter valid surnames (initial filter)
     ws_valid = [normalize_case(a) for a in ws_authors if is_valid_surname(a)]
     meta_valid = [normalize_case(a) for a in meta_authors if is_valid_surname(a)]
-    
+
+    # GPT validation for WebSearch results
+    if GPT_VALIDATE_WEBSEARCH and ws_valid:
+        validated, all_valid = validate_surnames_with_gpt(ws_valid, title)
+        gpt_validated_count += 1
+        if not all_valid or validated != ws_valid:
+            gpt_corrected_count += 1
+            item['gpt_validation'] = 'corrected'
+            item['original_ws_authors'] = ws_valid
+        else:
+            item['gpt_validation'] = 'passed'
+        ws_valid = validated
+
     # Determine final authors
     # Priority: WebSearch > Metadata (per user request)
     if ws_valid:
@@ -1967,6 +2392,10 @@ print(f"\nComparison complete:")
 print(f"  Success (ready to rename): {success_count}")
 print(f"  Alert (need PDF text search): {alert_count}")
 print(f"  Pending: {pending_count}")
+if GPT_VALIDATE_WEBSEARCH:
+    print(f"\nGPT Validation (WebSearch results):")
+    print(f"  Validated: {gpt_validated_count}")
+    print(f"  Corrected: {gpt_corrected_count}")
 
 # %%
 # Cell 9: Step 4 - PDF Text Search for _alert files (with OCR fallback and GPT validation)
@@ -1975,15 +2404,32 @@ alert_files = [x for x in pdf_data if x['status'] == 'alert']
 print(f"Processing {len(alert_files)} alert files with PDF text search...")
 print("Using: pdfplumber -> OCR fallback -> GPT surname validation")
 
+GPT_VALIDATE_PDF_TEXT = True  # Set to False to skip GPT validation for PDF text extraction
+pdf_gpt_validated = 0
+pdf_gpt_corrected = 0
+
 for i, item in enumerate(alert_files):
     if (i + 1) % 10 == 0:
         print(f"Processing {i+1}/{len(alert_files)}...")
 
     path = os.path.join(ARTICLES_DIR, item['filename'])
+    title = item.get('title', '')
 
     # Extract authors with OCR fallback and GPT validation
     # This function: pdfplumber -> OCR if needed -> GPT validates surnames
     text_authors, text_year, method = extract_authors_with_gpt_validation(path, use_gpt=True)
+
+    # Additional GPT validation for extracted authors (catch concatenated names, etc.)
+    if GPT_VALIDATE_PDF_TEXT and text_authors:
+        validated, all_valid = validate_surnames_with_gpt(text_authors, title)
+        pdf_gpt_validated += 1
+        if not all_valid or validated != text_authors:
+            pdf_gpt_corrected += 1
+            item['pdf_gpt_validation'] = 'corrected'
+            item['original_pdf_authors'] = text_authors
+        else:
+            item['pdf_gpt_validation'] = 'passed'
+        text_authors = validated
 
     # Update authors if we found valid ones
     if text_authors and not item['final_authors']:
@@ -2019,6 +2465,10 @@ print(f"  Success: {success_count}")
 print(f"  Fail: {fail_count}")
 print(f"  Alert (remaining): {alert_count}")
 print(f"  Japanese: {japanese_count}")
+if GPT_VALIDATE_PDF_TEXT:
+    print(f"\nGPT Validation (PDF text extraction):")
+    print(f"  Validated: {pdf_gpt_validated}")
+    print(f"  Corrected: {pdf_gpt_corrected}")
 
 
 # %%
@@ -2125,7 +2575,7 @@ print(f"Fail: {sum(1 for x in pdf_data if x['status'] == 'fail')}")
 # *** CAUTION: This will actually rename files! ***
 # Make sure you have a backup!
 
-EXECUTE_RENAME = False  # Set to True to actually rename files
+EXECUTE_RENAME = True  # Set to True to actually rename files
 
 if EXECUTE_RENAME:
     print("Starting file rename...")

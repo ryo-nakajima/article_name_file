@@ -10,6 +10,7 @@ websearch_progress.json
 pdf_rename_data.json
 pdf_rename_summary.json
 rename_results_final.json
+pdf_processing_progress.json
 
 # Output folders
 japanese/
