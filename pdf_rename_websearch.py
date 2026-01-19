@@ -2543,19 +2543,20 @@ for item in pdf_data:
             item['new_filename'] = None
             item['status'] = 'fail'
             item['fail_reason'] = 'filename_generation_failed'
-    elif item['status'] == 'fail':
-        # Add _fail suffix
-        base = os.path.splitext(item['filename'])[0]
-        base = re.sub(r'_(alert|fail)$', '', base)
-        item['new_filename'] = f"{base}_fail.pdf"
-    else:
-        # Alert - shouldn't happen at this point
-        base = os.path.splitext(item['filename'])[0]
-        base = re.sub(r'_(alert|fail)$', '', base)
-        item['new_filename'] = f"{base}_alert.pdf"
+    elif item['status'] in ('fail', 'alert'):
+        # Skip filename generation for fail/alert - will be moved to failure/ directory
+        item['new_filename'] = None
+        item['move_to_failure'] = True
+    # Japanese files keep their original name and move to japanese/
+
+success_count = sum(1 for x in pdf_data if x['status'] == 'success' and x.get('new_filename'))
+failure_count = sum(1 for x in pdf_data if x.get('move_to_failure'))
+japanese_count = sum(1 for x in pdf_data if x['status'] == 'japanese')
 
 print(f"Filename generation complete.")
-print(f"Files to rename: {sum(1 for x in pdf_data if x.get('new_filename'))}")
+print(f"  Files to rename: {success_count}")
+print(f"  Files to move to failure/: {failure_count}")
+print(f"  Files to move to japanese/: {japanese_count}")
 
 # %%
 # Cell 11: Preview changes before renaming
@@ -2599,7 +2600,8 @@ if EXECUTE_RENAME:
     # Create folders if needed
     japanese_dir = os.path.join(ARTICLES_DIR, 'japanese')
     research_dir = os.path.join(ARTICLES_DIR, 're-search')
-    for folder in [japanese_dir, research_dir]:
+    failure_dir = os.path.join(ARTICLES_DIR, 'failure')
+    for folder in [japanese_dir, research_dir, failure_dir]:
         if not os.path.exists(folder):
             os.makedirs(folder)
             print(f"Created directory: {folder}")
@@ -2607,37 +2609,56 @@ if EXECUTE_RENAME:
     renamed = []
     moved_japanese = []
     moved_research = []
-    failed = []
+    moved_failure = []
+    errors = []
 
     for item in pdf_data:
         old_name = item['filename']
         old_path = os.path.join(ARTICLES_DIR, old_name)
 
+        # Skip if file doesn't exist (already moved or deleted)
+        if not os.path.exists(old_path):
+            continue
+
         # Handle Japanese papers - move to japanese folder
         if item['status'] == 'japanese':
             new_path = os.path.join(japanese_dir, old_name)
             try:
-                if os.path.exists(old_path) and not os.path.exists(new_path):
+                if not os.path.exists(new_path):
                     os.rename(old_path, new_path)
                     moved_japanese.append({'old': old_name, 'new': f'japanese/{old_name}'})
                 else:
-                    failed.append({'old': old_name, 'new': f'japanese/{old_name}', 'reason': 'path conflict'})
+                    errors.append({'old': old_name, 'new': f'japanese/{old_name}', 'reason': 'path conflict'})
             except Exception as e:
-                failed.append({'old': old_name, 'new': f'japanese/{old_name}', 'reason': str(e)})
+                errors.append({'old': old_name, 'new': f'japanese/{old_name}', 'reason': str(e)})
+            continue
+
+        # Handle fail/alert papers - move to failure folder (for manual review)
+        if item.get('move_to_failure'):
+            new_path = os.path.join(failure_dir, old_name)
+            try:
+                if not os.path.exists(new_path):
+                    os.rename(old_path, new_path)
+                    moved_failure.append({'old': old_name, 'new': f'failure/{old_name}',
+                                         'status': item['status'], 'reason': item.get('fail_reason')})
+                else:
+                    errors.append({'old': old_name, 'new': f'failure/{old_name}', 'reason': 'path conflict'})
+            except Exception as e:
+                errors.append({'old': old_name, 'new': f'failure/{old_name}', 'reason': str(e)})
             continue
 
         # Handle OCR-only papers - move to re-search folder for manual verification
-        if item.get('title_method') == 'ocr':
-            new_name = item.get('new_filename', old_name)
+        if item.get('title_method') == 'ocr' and item.get('new_filename'):
+            new_name = item['new_filename']
             new_path = os.path.join(research_dir, new_name)
             try:
-                if os.path.exists(old_path) and not os.path.exists(new_path):
+                if not os.path.exists(new_path):
                     os.rename(old_path, new_path)
                     moved_research.append({'old': old_name, 'new': f're-search/{new_name}'})
                 else:
-                    failed.append({'old': old_name, 'new': f're-search/{new_name}', 'reason': 'path conflict'})
+                    errors.append({'old': old_name, 'new': f're-search/{new_name}', 'reason': 'path conflict'})
             except Exception as e:
-                failed.append({'old': old_name, 'new': f're-search/{new_name}', 'reason': str(e)})
+                errors.append({'old': old_name, 'new': f're-search/{new_name}', 'reason': str(e)})
             continue
 
         # Handle regular renaming
@@ -2649,27 +2670,29 @@ if EXECUTE_RENAME:
         new_path = os.path.join(ARTICLES_DIR, new_name)
 
         try:
-            if os.path.exists(old_path) and not os.path.exists(new_path):
+            if not os.path.exists(new_path):
                 os.rename(old_path, new_path)
                 renamed.append({'old': old_name, 'new': new_name})
             else:
-                failed.append({'old': old_name, 'new': new_name, 'reason': 'path conflict'})
+                errors.append({'old': old_name, 'new': new_name, 'reason': 'path conflict'})
         except Exception as e:
-            failed.append({'old': old_name, 'new': new_name, 'reason': str(e)})
+            errors.append({'old': old_name, 'new': new_name, 'reason': str(e)})
 
     print(f"\nRename complete:")
     print(f"  Renamed: {len(renamed)}")
     print(f"  Moved to japanese/: {len(moved_japanese)}")
+    print(f"  Moved to failure/: {len(moved_failure)}")
     print(f"  Moved to re-search/: {len(moved_research)}")
-    print(f"  Failed: {len(failed)}")
+    print(f"  Errors: {len(errors)}")
 
     # Save results
     with open(os.path.join(ARTICLES_DIR, 'rename_results_final.json'), 'w') as f:
         json.dump({
             'renamed': renamed,
             'moved_japanese': moved_japanese,
+            'moved_failure': moved_failure,
             'moved_research': moved_research,
-            'failed': failed,
+            'errors': errors,
             'timestamp': datetime.now().isoformat()
         }, f, ensure_ascii=False, indent=2)
 else:
