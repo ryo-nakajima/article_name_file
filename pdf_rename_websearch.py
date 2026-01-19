@@ -1288,12 +1288,24 @@ Given the beginning text of a PDF, extract:
 Return as JSON with this exact format:
 {"title": "Paper Title Here", "authors": ["Smith", "Chen", "Lee"], "year": "2023"}
 
-Rules:
-- Title: Usually largest text, near top (but not very top which is journal name)
-- Authors: Extract ONLY surnames/last names, not first names
-- Year: The publication year, usually 4 digits (1990-2026)
-- If any field is not found, use null
-- For authors, return empty array [] if none found"""
+Rules for TITLE:
+- The title is usually the LARGEST text near the top of the paper
+- NOT the journal name (which appears at very top or in header)
+- NOT copyright text like "Your use of the JSTOR archive indicates..."
+- NOT sentences from the paper body (titles don't have words like "we estimate", "taken together", "this paper")
+- If text has no spaces (concatenated like "Thisisthetitle"), try to find a properly spaced title elsewhere
+- Return null if you cannot find a clear, proper title
+
+Rules for AUTHORS:
+- Extract ONLY surnames/last names (e.g., "Smith" not "John Smith")
+- Authors often appear right below the title in SMALL CAPS or regular text
+- Look for patterns like "By FIRSTNAME LASTNAME" or "FIRSTNAME LASTNAME*"
+- Do NOT include journal names, institutions, or affiliations as authors
+- Return empty array [] if no clear author names found
+
+Rules for YEAR:
+- The publication year, usually 4 digits (1990-2026)
+- Often appears near copyright notice or in header/footer"""
         },
         {
             "role": "user",
