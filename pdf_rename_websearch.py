@@ -1922,13 +1922,11 @@ def extract_authors_with_gpt_validation(pdf_path: str, use_gpt: bool = True) -> 
 
     # Validate with GPT if enabled
     if use_gpt and authors:
-        validated = validate_surnames_with_gpt(authors)
+        validated, all_valid = validate_surnames_with_gpt(authors)
         if validated:
             authors = validated
             method = method + '_gpt'
-        else:
-            # GPT rejected all - keep original but note it
-            pass
+        # If GPT rejected all (validated is empty), keep original authors
 
     return authors, year, method
 
