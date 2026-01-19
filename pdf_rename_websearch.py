@@ -1154,35 +1154,129 @@ print("GPT functions defined.")
 # %%
 # Cell 4: PDF Text Search Functions (Fallback for _alert cases)
 
+# Superscript markers that indicate author names
+SUPERSCRIPT_MARKERS = r'[¹²³⁴⁵⁶⁷⁸⁹⁰ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ*†‡§¶∗⁺]'
+# ORCID icon patterns (may appear as text or special char)
+ORCID_PATTERN = r'[\U0001F194]|orcid\.org|ORCID'
+
+def clean_author_markers(text: str) -> str:
+    """Remove superscript markers, ORCID icons, and other annotations from author text."""
+    # Remove superscript numbers and letters
+    text = re.sub(r'[¹²³⁴⁵⁶⁷⁸⁹⁰ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ]+', '', text)
+    # Remove common markers
+    text = re.sub(r'[*†‡§¶∗⁺]+', '', text)
+    # Remove ORCID references
+    text = re.sub(r'\s*\([^)]*orcid[^)]*\)', '', text, flags=re.IGNORECASE)
+    # Remove standalone special chars
+    text = re.sub(r'\s*[ⓘ🆔]+\s*', ' ', text)
+    # Clean up whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def extract_surname_from_name(name: str) -> Optional[str]:
+    """Extract surname from a full name, handling various formats."""
+    name = clean_author_markers(name).strip()
+    if not name or len(name) < 2:
+        return None
+
+    # Remove Jr., Sr., III, IV, etc.
+    name = re.sub(r',?\s*(Jr\.?|Sr\.?|III|IV|II)\s*$', '', name, flags=re.IGNORECASE).strip()
+
+    # Split by spaces
+    parts = name.split()
+    if not parts:
+        return None
+
+    # Last word is surname (unless it's a middle initial)
+    surname = parts[-1]
+
+    # If surname looks like initial (single letter or letter with dot), use previous
+    if len(surname) <= 2 and len(parts) > 1:
+        surname = parts[-2]
+
+    # Normalize case (handle ALL CAPS and Small Caps)
+    surname = normalize_case(surname)
+
+    # Remove any remaining punctuation
+    surname = re.sub(r'[.,;:\'"]+$', '', surname)
+
+    if surname and is_valid_surname(surname):
+        return surname
+    return None
+
+
+def parse_author_line(line: str) -> List[str]:
+    """Parse a line that may contain multiple authors separated by various delimiters."""
+    authors = []
+
+    # Clean the line
+    line = clean_author_markers(line)
+
+    # Split by common separators: comma, semicolon, ampersand, "and", pipe
+    # Be careful not to split "Jr." or middle initials
+    parts = re.split(r'\s*[,;|]\s*|\s+&\s+|\s+and\s+', line, flags=re.IGNORECASE)
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        # Skip if it looks like an affiliation (contains university/institution keywords)
+        if re.search(r'\b(university|college|institute|school|department|dept)\b', part, re.IGNORECASE):
+            continue
+
+        surname = extract_surname_from_name(part)
+        if surname:
+            authors.append(surname)
+
+    return authors
+
+
+def has_superscript_markers(text: str) -> bool:
+    """Check if text contains superscript markers that often indicate author names."""
+    return bool(re.search(SUPERSCRIPT_MARKERS, text))
+
+
 def extract_authors_from_text(pdf_path: str) -> Tuple[List[str], Optional[str], bool, bool]:
     """
-    Extract authors and year from PDF text.
+    Extract authors and year from PDF text using multiple detection patterns.
+
+    Patterns supported:
+    - "Author(s):" prefix
+    - "By Author Name" prefix
+    - Names with superscript markers (¹²³*†‡ᵃᵇᶜ)
+    - Vertical list of names (Working Paper style)
+    - Horizontal names with separators (comma, and, &, |)
+    - Small Caps names (DAVID A. REINSTEIN)
+    - Names with Jr./Sr./III suffixes
+
     Returns: (authors, year, is_readable, is_japanese)
     """
     authors = []
     year = None
-    
+
     try:
         with pdfplumber.open(pdf_path) as pdf:
             if not pdf.pages:
                 return [], None, False, False
-            
+
             text = pdf.pages[0].extract_text() or ""
             if not text or len(text) < 50:
                 return [], None, False, False
-            
+
             # Check for unreadable text (cid format)
             cid_count = len(re.findall(r'\(cid:\d+\)', text[:2000]))
             if cid_count > 10:
                 return [], None, False, False
-            
+
             # Check for Japanese/Chinese characters
             if re.search(r'[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]', text[:500]):
                 return [], None, True, True  # is_readable=True, is_japanese=True
-            
+
             lines = text.split('\n')
-            
-            # Find year
+
+            # === Find year ===
             for line in lines[:30]:
                 # Skip data range lines
                 if re.search(r'data|sample|period|survey', line, re.IGNORECASE):
@@ -1190,7 +1284,7 @@ def extract_authors_from_text(pdf_path: str) -> Tuple[List[str], Optional[str], 
                 # Skip year ranges
                 if re.search(r'\b(19[6-9]\d|20[0-2]\d)[–—-](19[6-9]\d|20[0-2]\d)\b', line):
                     continue
-                
+
                 # Look for publication year patterns
                 pub_match = re.search(r'(?:published|©|copyright|\(|received|accepted)[:\s]*(\d{4})', line, re.IGNORECASE)
                 if pub_match:
@@ -1198,46 +1292,128 @@ def extract_authors_from_text(pdf_path: str) -> Tuple[List[str], Optional[str], 
                     if 1960 <= y <= 2026:
                         year = str(y)
                         break
-                
+
                 # Standalone year
                 match = re.search(r'\b(19[6-9]\d|20[0-2]\d)\b', line)
                 if match and not year:
                     year = match.group(1)
-            
-            # Find authors
+
+            # === Find authors ===
+
+            # Pattern 1: "Author(s):" prefix (explicit field)
+            for line in lines[:20]:
+                auth_match = re.match(r'^[Aa]uthor\(?s?\)?[:\s]+(.+)$', line)
+                if auth_match:
+                    authors = parse_author_line(auth_match.group(1))
+                    if authors:
+                        return authors, year, True, False
+
+            # Pattern 2: "By Author" prefix
+            for line in lines[:20]:
+                by_match = re.match(r'^[Bb][Yy]\s+(.+)$', line.strip())
+                if by_match:
+                    authors = parse_author_line(by_match.group(1))
+                    if authors:
+                        return authors, year, True, False
+
+            # Pattern 3: Lines with superscript markers (strong indicator of author names)
+            for line in lines[:25]:
+                line = line.strip()
+                if 10 < len(line) < 150 and has_superscript_markers(line):
+                    # Skip if line looks like title or abstract
+                    if re.search(r'^(abstract|introduction|keywords)', line, re.IGNORECASE):
+                        continue
+                    parsed = parse_author_line(line)
+                    if parsed:
+                        authors.extend(parsed)
+
+            if authors:
+                return list(dict.fromkeys(authors)), year, True, False  # dedupe while preserving order
+
+            # Pattern 4: Vertical list detection (Working Paper style)
+            # Look for consecutive short lines that look like names
+            name_pattern = re.compile(
+                r'^([A-Z][a-zà-ÿ]+)\s+'  # First name
+                r'([A-Z]\.?\s+)?'         # Optional middle initial
+                r'([A-Z][a-zà-ÿ]+)'       # Last name
+                r'[*†‡§¶¹²³ᵃᵇᶜ]*$'        # Optional markers
+            )
+            consecutive_names = []
+            for i, line in enumerate(lines[:30]):
+                line = line.strip()
+                if 8 < len(line) < 50:
+                    # Check if line matches name pattern
+                    if name_pattern.match(line):
+                        surname = extract_surname_from_name(line)
+                        if surname:
+                            consecutive_names.append((i, surname))
+                    # Also check ALL CAPS pattern
+                    elif re.match(r'^[A-Z]{2,}\s+([A-Z]\.?\s+)?[A-Z]{2,}[*†‡§¶¹²³ᵃᵇᶜ]*$', line):
+                        surname = extract_surname_from_name(line)
+                        if surname:
+                            consecutive_names.append((i, surname))
+
+            # If we found consecutive name lines (within 3 lines of each other)
+            if len(consecutive_names) >= 2:
+                groups = []
+                current_group = [consecutive_names[0]]
+                for j in range(1, len(consecutive_names)):
+                    if consecutive_names[j][0] - consecutive_names[j-1][0] <= 3:
+                        current_group.append(consecutive_names[j])
+                    else:
+                        if len(current_group) >= 2:
+                            groups.append(current_group)
+                        current_group = [consecutive_names[j]]
+                if len(current_group) >= 2:
+                    groups.append(current_group)
+
+                # Use the largest group
+                if groups:
+                    best_group = max(groups, key=len)
+                    authors = [name for _, name in best_group]
+                    return authors, year, True, False
+
+            # Pattern 5: Single name with markers or standard patterns
             for line in lines[:25]:
                 line = line.strip()
                 if len(line) > 80 or len(line) < 5:
                     continue
-                
-                # "By Author" pattern
-                by_match = re.match(r'^[Bb][Yy]\s+(.+)$', line)
-                if by_match:
-                    author_str = by_match.group(1)
-                    parts = re.split(r'[,;&]|\band\b', author_str, flags=re.IGNORECASE)
-                    for part in parts:
-                        words = part.strip().split()
-                        if words:
-                            surname = normalize_case(words[-1])
-                            if surname and is_valid_surname(surname):
-                                authors.append(surname)
-                    if authors:
-                        break
-                
-                # "First M. Last" pattern
-                match = re.match(r'^([A-Z][a-z]+)\s+([A-Z]\.?\s+)?([A-Z][a-z]+)[*†∗‡§¶]*$', line)
-                if match and len(line) < 40:
+
+                # Skip common non-author lines
+                if re.search(r'^(abstract|introduction|keywords|doi|http|volume|issue)', line, re.IGNORECASE):
+                    continue
+
+                # "First M. Last" pattern with optional markers
+                match = re.match(
+                    r'^([A-Z][a-zà-ÿ]+)\s+'       # First name
+                    r'([A-Z]\.?\s+)?'              # Optional middle initial
+                    r'([A-Z][a-zà-ÿ]+)'           # Last name
+                    r'(?:\s*,\s*(Jr\.?|Sr\.?|III|IV|II))?'  # Optional suffix
+                    r'[*†∗‡§¶¹²³ᵃᵇᶜ]*$',          # Optional markers
+                    line
+                )
+                if match and len(line) < 50:
                     surname = match.group(3)
                     if is_valid_surname(surname):
                         authors.append(surname)
-                
-                # ALL CAPS name pattern
-                match = re.match(r'^([A-Z]{2,})\s+([A-Z]\.?\s*)?([A-Z]{2,})[*†∗‡§¶]*$', line)
-                if match and len(line) < 35:
+
+                # ALL CAPS / Small Caps pattern
+                match = re.match(
+                    r'^([A-Z]{2,})\s+'              # First name (caps)
+                    r'([A-Z]\.?\s+)?'               # Optional middle
+                    r'([A-Z]{2,})'                  # Last name (caps)
+                    r'(?:\s*,\s*(Jr\.?|Sr\.?|III|IV|II))?'
+                    r'[*†∗‡§¶¹²³ᵃᵇᶜ]*$',
+                    line
+                )
+                if match and len(line) < 45:
                     surname = normalize_case(match.group(3))
                     if surname and is_valid_surname(surname):
                         authors.append(surname)
-            
+
+            # Dedupe while preserving order
+            authors = list(dict.fromkeys(authors))
+
             return authors, year, True, False  # is_readable=True, is_japanese=False
 
     except Exception as e:
@@ -1248,6 +1424,14 @@ def extract_authors_from_ocr(pdf_path: str, max_pages: int = 2) -> Tuple[List[st
     """
     Extract authors and year from PDF using OCR.
     Fallback when pdfplumber can't extract text.
+
+    Uses same detection patterns as extract_authors_from_text:
+    - "Author(s):" prefix
+    - "By Author Name" prefix
+    - Names with superscript markers
+    - Vertical list of names
+    - Horizontal names with separators
+    - Small Caps names
 
     Returns: (authors, year)
     """
@@ -1266,7 +1450,7 @@ def extract_authors_from_ocr(pdf_path: str, max_pages: int = 2) -> Tuple[List[st
 
             lines = text.split('\n')
 
-            # Find year
+            # === Find year ===
             for line in lines[:30]:
                 if re.search(r'data|sample|period|survey', line, re.IGNORECASE):
                     continue
@@ -1284,42 +1468,114 @@ def extract_authors_from_ocr(pdf_path: str, max_pages: int = 2) -> Tuple[List[st
                 if match and not year:
                     year = match.group(1)
 
-            # Find authors
+            # === Find authors ===
+
+            # Pattern 1: "Author(s):" prefix
+            for line in lines[:20]:
+                auth_match = re.match(r'^[Aa]uthor\(?s?\)?[:\s]+(.+)$', line)
+                if auth_match:
+                    authors = parse_author_line(auth_match.group(1))
+                    if authors:
+                        return authors, year
+
+            # Pattern 2: "By Author" prefix
+            for line in lines[:20]:
+                by_match = re.match(r'^[Bb][Yy]\s+(.+)$', line.strip())
+                if by_match:
+                    authors = parse_author_line(by_match.group(1))
+                    if authors:
+                        return authors, year
+
+            # Pattern 3: Lines with superscript markers
+            for line in lines[:25]:
+                line = line.strip()
+                if 10 < len(line) < 150 and has_superscript_markers(line):
+                    if re.search(r'^(abstract|introduction|keywords)', line, re.IGNORECASE):
+                        continue
+                    parsed = parse_author_line(line)
+                    if parsed:
+                        authors.extend(parsed)
+
+            if authors:
+                return list(dict.fromkeys(authors)), year
+
+            # Pattern 4: Vertical list detection
+            name_pattern = re.compile(
+                r'^([A-Z][a-zà-ÿ]+)\s+'
+                r'([A-Z]\.?\s+)?'
+                r'([A-Z][a-zà-ÿ]+)'
+                r'[*†‡§¶¹²³ᵃᵇᶜ]*$'
+            )
+            consecutive_names = []
+            for i, line in enumerate(lines[:30]):
+                line = line.strip()
+                if 8 < len(line) < 50:
+                    if name_pattern.match(line):
+                        surname = extract_surname_from_name(line)
+                        if surname:
+                            consecutive_names.append((i, surname))
+                    elif re.match(r'^[A-Z]{2,}\s+([A-Z]\.?\s+)?[A-Z]{2,}[*†‡§¶¹²³ᵃᵇᶜ]*$', line):
+                        surname = extract_surname_from_name(line)
+                        if surname:
+                            consecutive_names.append((i, surname))
+
+            if len(consecutive_names) >= 2:
+                groups = []
+                current_group = [consecutive_names[0]]
+                for j in range(1, len(consecutive_names)):
+                    if consecutive_names[j][0] - consecutive_names[j-1][0] <= 3:
+                        current_group.append(consecutive_names[j])
+                    else:
+                        if len(current_group) >= 2:
+                            groups.append(current_group)
+                        current_group = [consecutive_names[j]]
+                if len(current_group) >= 2:
+                    groups.append(current_group)
+
+                if groups:
+                    best_group = max(groups, key=len)
+                    authors = [name for _, name in best_group]
+                    return authors, year
+
+            # Pattern 5: Standard name patterns
             for line in lines[:25]:
                 line = line.strip()
                 if len(line) > 80 or len(line) < 5:
                     continue
 
-                # "By Author" pattern
-                by_match = re.match(r'^[Bb][Yy]\s+(.+)$', line)
-                if by_match:
-                    author_str = by_match.group(1)
-                    parts = re.split(r'[,;&]|\band\b', author_str, flags=re.IGNORECASE)
-                    for part in parts:
-                        words = part.strip().split()
-                        if words:
-                            surname = normalize_case(words[-1])
-                            if surname and is_valid_surname(surname):
-                                authors.append(surname)
-                    if authors:
-                        break
+                if re.search(r'^(abstract|introduction|keywords|doi|http|volume|issue)', line, re.IGNORECASE):
+                    continue
 
                 # "First M. Last" pattern
-                match = re.match(r'^([A-Z][a-z]+)\s+([A-Z]\.?\s+)?([A-Z][a-z]+)[*†∗‡§¶]*$', line)
-                if match and len(line) < 40:
+                match = re.match(
+                    r'^([A-Z][a-zà-ÿ]+)\s+'
+                    r'([A-Z]\.?\s+)?'
+                    r'([A-Z][a-zà-ÿ]+)'
+                    r'(?:\s*,\s*(Jr\.?|Sr\.?|III|IV|II))?'
+                    r'[*†∗‡§¶¹²³ᵃᵇᶜ]*$',
+                    line
+                )
+                if match and len(line) < 50:
                     surname = match.group(3)
                     if is_valid_surname(surname):
                         authors.append(surname)
 
-                # ALL CAPS name pattern
-                match = re.match(r'^([A-Z]{2,})\s+([A-Z]\.?\s*)?([A-Z]{2,})[*†∗‡§¶]*$', line)
-                if match and len(line) < 35:
+                # ALL CAPS pattern
+                match = re.match(
+                    r'^([A-Z]{2,})\s+'
+                    r'([A-Z]\.?\s+)?'
+                    r'([A-Z]{2,})'
+                    r'(?:\s*,\s*(Jr\.?|Sr\.?|III|IV|II))?'
+                    r'[*†∗‡§¶¹²³ᵃᵇᶜ]*$',
+                    line
+                )
+                if match and len(line) < 45:
                     surname = normalize_case(match.group(3))
                     if surname and is_valid_surname(surname):
                         authors.append(surname)
 
-            # If we found authors on this page, stop
             if authors:
+                authors = list(dict.fromkeys(authors))
                 break
 
         return authors, year
