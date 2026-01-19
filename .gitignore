@@ -1,0 +1,72 @@
+# Jupyter Notebooks (tracked via pypercent .py files)
+*.ipynb
+.ipynb_checkpoints/
+
+# PDF files
+*.pdf
+
+# JSON output files
+websearch_progress.json
+pdf_rename_data.json
+pdf_rename_summary.json
+rename_results_final.json
+
+# Output folders
+japanese/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Other files in this directory (not part of this project)
+*.html
+*.webarchive
+*.zip
+*.ps
+*.csv
+*.txt
+Rotemberg/
+specification/
+
+# Old Python scripts (kept locally)
+extract_titles.py
+rename_need_check.py
+rename_pdfs.py
+rename_v4.py
+rename_with_metadata.py
+verify_with_scholar.py
+websearch_verify.py
+
+# Old JSON files
+metadata_rename_results.json
+needs_websearch.json
+needs_websearch_final.json
+needs_websearch_only.json
+pdf_info.json
+rename_results.json
+rename_v4_results.json
+scholar_verification_results.json
+websearch_queries.json
+websearch_results.json
+
+# Thomassen file
+Thomassen_et_al.20160055
