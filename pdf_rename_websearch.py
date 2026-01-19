@@ -2318,16 +2318,23 @@ print(f"  - Title found but search failed: {ws_not_found}")
 # %%
 # Cell 8: Step 3 - Compare WebSearch results with metadata and determine final authors/year
 # Now includes GPT validation for WebSearch results to catch API errors (e.g., "Enough" instead of "Englich")
+# Skips already processed files (incremental processing)
 
 print("Comparing WebSearch results with metadata (with GPT validation)...")
 
 GPT_VALIDATE_WEBSEARCH = True  # Set to False to skip GPT validation (faster but less accurate)
 gpt_validated_count = 0
 gpt_corrected_count = 0
+skipped_count = 0
 
 for i, item in enumerate(pdf_data):
     if (i + 1) % 100 == 0:
         print(f"Processing {i+1}/{len(pdf_data)}...")
+
+    # Skip if already successfully processed with GPT validation
+    if item.get('status') == 'success' and item.get('gpt_validation') in ('passed', 'corrected'):
+        skipped_count += 1
+        continue
 
     filename = item['filename']
     ws_authors = item['websearch_authors'] or []
@@ -2392,6 +2399,7 @@ print(f"\nComparison complete:")
 print(f"  Success (ready to rename): {success_count}")
 print(f"  Alert (need PDF text search): {alert_count}")
 print(f"  Pending: {pending_count}")
+print(f"  Skipped (already processed): {skipped_count}")
 if GPT_VALIDATE_WEBSEARCH:
     print(f"\nGPT Validation (WebSearch results):")
     print(f"  Validated: {gpt_validated_count}")
@@ -2399,9 +2407,17 @@ if GPT_VALIDATE_WEBSEARCH:
 
 # %%
 # Cell 9: Step 4 - PDF Text Search for _alert files (with OCR fallback and GPT validation)
+# Skips already processed files (incremental processing)
 
-alert_files = [x for x in pdf_data if x['status'] == 'alert']
+# Only process files that need PDF text search AND haven't been GPT validated yet
+alert_files = [x for x in pdf_data
+               if x['status'] == 'alert'
+               and x.get('pdf_gpt_validation') not in ('passed', 'corrected')]
+already_processed = sum(1 for x in pdf_data
+                        if x.get('pdf_gpt_validation') in ('passed', 'corrected'))
+
 print(f"Processing {len(alert_files)} alert files with PDF text search...")
+print(f"Skipping {already_processed} already GPT-validated files")
 print("Using: pdfplumber -> OCR fallback -> GPT surname validation")
 
 GPT_VALIDATE_PDF_TEXT = True  # Set to False to skip GPT validation for PDF text extraction
