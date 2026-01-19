@@ -1456,6 +1456,110 @@ Examples:
 print("GPT functions defined.")
 
 
+# --- Year extraction fallback functions ---
+
+def extract_year_from_title(title: str) -> Optional[str]:
+    """
+    Extract publication year from title string.
+    Looks for 4-digit years (1960-2026) at the end or in parentheses.
+    """
+    if not title:
+        return None
+
+    # Pattern 1: Year at the end of title "... 2022" or "... (2022)"
+    match = re.search(r'\b(19[6-9]\d|20[0-2]\d)\s*$', title)
+    if match:
+        return match.group(1)
+
+    # Pattern 2: Year in parentheses "(2022)"
+    match = re.search(r'\((\d{4})\)', title)
+    if match:
+        y = int(match.group(1))
+        if 1960 <= y <= 2026:
+            return match.group(1)
+
+    # Pattern 3: "Working Paper XXXXX" - NBER papers often have year in title
+    match = re.search(r'Working\s+Paper\s+(?:No\.?\s*)?(\d+)', title, re.IGNORECASE)
+    if match:
+        wp_num = int(match.group(1))
+        # NBER WP numbers roughly correspond to years (very approximate)
+        year = nber_wp_to_year(wp_num)
+        if year:
+            return year
+
+    return None
+
+
+def extract_year_from_filename(filename: str) -> Optional[str]:
+    """
+    Extract year from original filename.
+    Many downloaded PDFs have year in the filename.
+    """
+    if not filename:
+        return None
+
+    # Remove extension
+    name = re.sub(r'\.pdf$', '', filename, flags=re.IGNORECASE)
+
+    # Pattern 1: Year at the end "Author_2022" or "Author2022"
+    match = re.search(r'[_\-]?(19[6-9]\d|20[0-2]\d)(?:[_\-][a-z])?$', name)
+    if match:
+        return match.group(1)
+
+    # Pattern 2: Year anywhere in filename
+    matches = re.findall(r'\b(19[6-9]\d|20[0-2]\d)\b', name)
+    if len(matches) == 1:
+        return matches[0]
+    elif len(matches) > 1:
+        # Multiple years - return the most recent (likely publication year)
+        return max(matches)
+
+    return None
+
+
+def nber_wp_to_year(wp_number: int) -> Optional[str]:
+    """
+    Estimate publication year from NBER Working Paper number.
+    Based on approximate WP number ranges.
+
+    NBER WP numbering:
+    - ~1000 in 1980
+    - ~5000 in 1995
+    - ~10000 in 2003
+    - ~15000 in 2009
+    - ~20000 in 2014
+    - ~25000 in 2018
+    - ~30000 in 2022
+    """
+    if wp_number < 1000:
+        return None
+    elif wp_number < 2000:
+        year = 1980 + (wp_number - 1000) // 200
+    elif wp_number < 5000:
+        year = 1985 + (wp_number - 2000) // 300
+    elif wp_number < 10000:
+        year = 1995 + (wp_number - 5000) // 625
+    elif wp_number < 15000:
+        year = 2003 + (wp_number - 10000) // 830
+    elif wp_number < 20000:
+        year = 2009 + (wp_number - 15000) // 1000
+    elif wp_number < 25000:
+        year = 2014 + (wp_number - 20000) // 1250
+    elif wp_number < 30000:
+        year = 2018 + (wp_number - 25000) // 1250
+    elif wp_number < 35000:
+        year = 2022 + (wp_number - 30000) // 1500
+    else:
+        year = 2025
+
+    if 1960 <= year <= 2026:
+        return str(year)
+    return None
+
+
+print("Year extraction fallback functions defined.")
+
+
 # %%
 # Cell 4: PDF Text Search Functions (Fallback for _alert cases)
 
@@ -2508,7 +2612,8 @@ for i, item in enumerate(pdf_data):
         item['status'] = 'alert'  # Need PDF text search
     
     # Determine final year
-    # Priority: Metadata year (per user request)
+    # Priority: Metadata > WebSearch > Filename
+    # Note: Title extraction removed (too error-prone)
     if meta_year:
         item['final_year'] = meta_year
         item['year_source'] = 'metadata'
@@ -2516,11 +2621,17 @@ for i, item in enumerate(pdf_data):
         item['final_year'] = ws_year
         item['year_source'] = 'websearch'
     else:
-        item['final_year'] = None
-        item['year_source'] = 'none'
-        if item['status'] != 'alert':
-            item['status'] = 'alert'  # Need PDF text search for year
-    
+        # Fallback: Extract from original filename
+        filename_year = extract_year_from_filename(filename)
+        if filename_year:
+            item['final_year'] = filename_year
+            item['year_source'] = 'filename'
+        else:
+            item['final_year'] = None
+            item['year_source'] = 'none'
+            if item['status'] != 'alert':
+                item['status'] = 'alert'  # Need PDF text search for year
+
     # If we have valid authors and year, mark as success
     if item['final_authors'] and item['final_year']:
         item['status'] = 'success'
@@ -2602,8 +2713,11 @@ for i, item in enumerate(alert_files):
         item['status'] = 'fail'
         item['fail_reason'] = 'no_valid_authors'
     elif not item['final_year']:
-        item['status'] = 'fail'
-        item['fail_reason'] = 'no_valid_year'
+        # Have authors but no year - use n.d. (no date) and mark as alert
+        item['status'] = 'alert'
+        item['alert_reason'] = 'no_year_use_nd'
+        item['final_year'] = 'n.d.'
+        item['year_source'] = 'fallback_nd'
 
 # Final summary
 success_count = sum(1 for x in pdf_data if x['status'] == 'success')
