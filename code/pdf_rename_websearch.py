@@ -75,7 +75,7 @@ def load_progress() -> Dict:
         'last_updated': timestamp
     }
     """
-    progress_path = os.path.join(ARTICLES_DIR, PROGRESS_FILE)
+    progress_path = os.path.join(DATA_DIR, PROGRESS_FILE)
     if os.path.exists(progress_path):
         try:
             with open(progress_path, 'r') as f:
@@ -93,7 +93,7 @@ def load_progress() -> Dict:
 
 def save_progress(progress: Dict):
     """Save progress to file."""
-    progress_path = os.path.join(ARTICLES_DIR, PROGRESS_FILE)
+    progress_path = os.path.join(DATA_DIR, PROGRESS_FILE)
     progress['last_updated'] = datetime.now().isoformat()
     try:
         with open(progress_path, 'w') as f:
@@ -196,9 +196,19 @@ check_and_install_dependencies()
 openai_client = OpenAI()  # Uses OPENAI_API_KEY from environment
 GPT_MODEL = "gpt-4o-mini"  # Cost-effective model for this task
 
-# Directory containing PDFs
-ARTICLES_DIR = os.getcwd()  # Change this if running from different location
-print(f"Working directory: {ARTICLES_DIR}")
+# Directory paths
+# When running from code/, ARTICLES_DIR is the parent directory
+CODE_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() else os.getcwd()
+ARTICLES_DIR = os.path.dirname(CODE_DIR)  # Parent of code/
+DATA_DIR = os.path.join(CODE_DIR, 'data')  # code/data/ for JSON files
+
+# Create data directory if it doesn't exist
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
+
+print(f"Code directory: {CODE_DIR}")
+print(f"Articles directory: {ARTICLES_DIR}")
+print(f"Data directory: {DATA_DIR}")
 print(f"PDF count: {len([f for f in os.listdir(ARTICLES_DIR) if f.lower().endswith('.pdf')])}")
 print(f"OpenAI API: Ready (model: {GPT_MODEL})")
 
@@ -3085,7 +3095,7 @@ if EXECUTE_RENAME:
             print(f"    Reason: {item.get('alert_reason')}, Authors: {item.get('authors')}")
 
     # Save results
-    with open(os.path.join(ARTICLES_DIR, 'rename_results_final.json'), 'w') as f:
+    with open(os.path.join(DATA_DIR, 'rename_results_final.json'), 'w') as f:
         json.dump({
             'renamed': renamed,
             'moved_japanese': moved_japanese,
@@ -3117,7 +3127,7 @@ else:
 # Cell 13: Save final results
 
 # Save all data
-with open(os.path.join(ARTICLES_DIR, 'pdf_rename_data.json'), 'w') as f:
+with open(os.path.join(DATA_DIR, 'pdf_rename_data.json'), 'w') as f:
     json.dump(pdf_data, f, ensure_ascii=False, indent=2)
 
 # Save summary
@@ -3167,7 +3177,7 @@ for item in pdf_data:
         reason = item.get('fail_reason', 'unknown')
         summary['fail_reasons'][reason] = summary['fail_reasons'].get(reason, 0) + 1
 
-with open(os.path.join(ARTICLES_DIR, 'pdf_rename_summary.json'), 'w') as f:
+with open(os.path.join(DATA_DIR, 'pdf_rename_summary.json'), 'w') as f:
     json.dump(summary, f, ensure_ascii=False, indent=2)
 
 print("Results saved:")
@@ -3271,7 +3281,7 @@ if DETECT_DUPLICATES:
             'moved_duplicates': moved_duplicates,
             'timestamp': datetime.now().isoformat()
         }
-        with open(os.path.join(ARTICLES_DIR, 'duplicate_files.json'), 'w') as f:
+        with open(os.path.join(DATA_DIR, 'duplicate_files.json'), 'w') as f:
             json.dump(duplicate_info, f, ensure_ascii=False, indent=2)
         print(f"  Saved info to duplicate_files.json")
 else:
