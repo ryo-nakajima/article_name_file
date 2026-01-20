@@ -3175,3 +3175,104 @@ print(f"  - pdf_rename_data.json (full data)")
 print(f"  - pdf_rename_summary.json (summary)")
 print()
 print(json.dumps(summary, indent=2))
+
+
+# %%
+# Cell 14: Detect and move duplicate files
+# - Finds files like Name_Year.pdf, Name_Year_a.pdf, Name_Year_b.pdf
+# - Compares MD5 hashes to detect identical content
+# - Moves duplicates (_a, _b, etc.) to duplicate/ folder
+# - Keeps the base file (without suffix)
+
+DETECT_DUPLICATES = True  # Set to False to skip duplicate detection
+
+if DETECT_DUPLICATES:
+    print("=== Detecting duplicate files ===")
+
+    # Create duplicate folder
+    duplicate_dir = os.path.join(ARTICLES_DIR, 'duplicate')
+    if not os.path.exists(duplicate_dir):
+        os.makedirs(duplicate_dir)
+        print(f"Created directory: {duplicate_dir}")
+
+    # Get all PDF files in ARTICLES_DIR (not subfolders)
+    pdf_files = [f for f in os.listdir(ARTICLES_DIR)
+                 if f.lower().endswith('.pdf') and os.path.isfile(os.path.join(ARTICLES_DIR, f))]
+
+    # Group files by base name (without _a, _b, etc. suffix)
+    # Pattern: Name_Year.pdf, Name_Year_a.pdf, Name_Year_b.pdf, etc.
+    file_groups = {}  # base_name -> list of (filename, suffix_order)
+
+    for filename in pdf_files:
+        # Check if filename has _a, _b, etc. suffix before .pdf
+        match = re.match(r'^(.+?)(_[a-z])?\.pdf$', filename, re.IGNORECASE)
+        if match:
+            base_name = match.group(1)
+            suffix = match.group(2)  # None or '_a', '_b', etc.
+
+            if base_name not in file_groups:
+                file_groups[base_name] = []
+
+            # Assign order: no suffix = 0, _a = 1, _b = 2, etc.
+            if suffix is None:
+                order = 0
+            else:
+                order = ord(suffix[-1].lower()) - ord('a') + 1
+
+            file_groups[base_name].append((filename, order))
+
+    # Find groups with potential duplicates (more than one file)
+    duplicate_candidates = {k: v for k, v in file_groups.items() if len(v) > 1}
+    print(f"Found {len(duplicate_candidates)} file groups with potential duplicates")
+
+    # Check for actual duplicates using MD5 hash
+    moved_duplicates = []
+
+    for base_name, files in duplicate_candidates.items():
+        # Sort by order (base file first, then _a, _b, etc.)
+        files.sort(key=lambda x: x[1])
+
+        # Calculate hashes for all files in the group
+        file_hashes = {}  # filename -> hash
+        for filename, _ in files:
+            path = os.path.join(ARTICLES_DIR, filename)
+            file_hash = calculate_file_hash(path)
+            file_hashes[filename] = file_hash
+
+        # The base file (first one, order=0 or lowest order) is kept
+        base_file = files[0][0]
+        base_hash = file_hashes[base_file]
+
+        # Check if other files are duplicates of the base file
+        for filename, order in files[1:]:
+            if file_hashes[filename] == base_hash:
+                # This is a duplicate - move to duplicate folder
+                old_path = os.path.join(ARTICLES_DIR, filename)
+                new_path = os.path.join(duplicate_dir, filename)
+
+                try:
+                    if os.path.exists(old_path) and not os.path.exists(new_path):
+                        os.rename(old_path, new_path)
+                        moved_duplicates.append({
+                            'filename': filename,
+                            'base_file': base_file,
+                            'hash': base_hash
+                        })
+                        print(f"  Moved duplicate: {filename} (same as {base_file})")
+                except Exception as e:
+                    print(f"  Error moving {filename}: {e}")
+
+    print(f"\nDuplicate detection complete:")
+    print(f"  Moved to duplicate/: {len(moved_duplicates)}")
+
+    # Save duplicate info to JSON
+    if moved_duplicates:
+        duplicate_info = {
+            'moved_duplicates': moved_duplicates,
+            'timestamp': datetime.now().isoformat()
+        }
+        with open(os.path.join(ARTICLES_DIR, 'duplicate_files.json'), 'w') as f:
+            json.dump(duplicate_info, f, ensure_ascii=False, indent=2)
+        print(f"  Saved info to duplicate_files.json")
+else:
+    print("Duplicate detection skipped (DETECT_DUPLICATES = False)")

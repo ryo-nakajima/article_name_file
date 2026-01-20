@@ -11,12 +11,14 @@ pdf_rename_data.json
 pdf_rename_summary.json
 rename_results_final.json
 pdf_processing_progress.json
+duplicate_files.json
 
 # Output folders
 japanese/
 re-search/
 alert/
 failure/
+duplicate/
 
 # Python cache
 __pycache__/
