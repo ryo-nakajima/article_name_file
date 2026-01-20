@@ -2614,7 +2614,7 @@ if RESET_BAD_TITLES:
 
     # Reset files with bad title indicators
     for file_hash, entry in progress_check['by_hash'].items():
-        title = entry.get('title', '').lower()
+        title = (entry.get('title') or '').lower()
         should_reset = False
 
         # Check for boilerplate in title
