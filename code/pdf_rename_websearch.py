@@ -140,7 +140,7 @@ def should_process_extraction(progress: Dict, file_hash: str) -> bool:
 
 
 def should_process_websearch(progress: Dict, file_hash: str) -> bool:
-    """Check if file needs WebSearch (extracted but not searched)."""
+    """Check if file needs WebSearch (extracted but not searched, or previously failed/alert)."""
     if file_hash not in progress['by_hash']:
         return False  # Can't search without extraction
 
@@ -154,10 +154,16 @@ def should_process_websearch(progress: Dict, file_hash: str) -> bool:
     if not entry.get('title'):
         return False
 
-    # Process if websearch not done or failed
+    # Re-process files that previously failed or were alert
+    # This allows new fixes (filename parsing, title normalization) to be applied
+    status = entry.get('status', '')
+    if status in ('fail', 'alert'):
+        return True  # Re-process failed/alert files
+
+    # Process if websearch not done
     websearch_status = entry.get('websearch_status', '')
     if websearch_status in ('done', 'not_found'):
-        return False  # Already searched
+        return False  # Already searched and succeeded
 
     return True
 
