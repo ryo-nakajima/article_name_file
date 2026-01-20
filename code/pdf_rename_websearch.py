@@ -3403,14 +3403,17 @@ for i, item in enumerate(pdf_data):
                 item['final_authors'] = validated
                 authors = validated
 
-        # Alert: generate filename and move to alert/ directory for human review
+        # Alert: generate filename but treat as success (no move to alert/)
+        # Alert list will be saved separately for reference
         new_name = generate_filename(authors, item['final_year'], existing)
         if new_name:
             item['new_filename'] = new_name
             existing.add(new_name.lower())
+            item['is_alert'] = True  # Mark for alert list recording
         else:
             item['new_filename'] = None
-        item['move_to_alert'] = True
+            item['status'] = 'fail'
+            item['fail_reason'] = 'filename_generation_failed'
 
     elif item['status'] == 'fail':
         # Fail: no filename, move to failure/ directory
@@ -3422,13 +3425,13 @@ if GPT_FINAL_VALIDATION:
     print(f"  GPT rejected {gpt_rejected_count} files with invalid authors")
 
 success_count = sum(1 for x in pdf_data if x['status'] == 'success' and x.get('new_filename'))
-alert_count = sum(1 for x in pdf_data if x.get('move_to_alert'))
+alert_count = sum(1 for x in pdf_data if x.get('is_alert') and x.get('new_filename'))
 failure_count = sum(1 for x in pdf_data if x.get('move_to_failure'))
 japanese_count = sum(1 for x in pdf_data if x['status'] == 'japanese')
 
 print(f"Filename generation complete.")
-print(f"  Files to rename: {success_count}")
-print(f"  Files to move to alert/: {alert_count}")
+print(f"  Files to rename (success): {success_count}")
+print(f"  Files to rename (alert, for reference): {alert_count}")
 print(f"  Files to move to failure/: {failure_count}")
 print(f"  Files to move to japanese/: {japanese_count}")
 
@@ -3488,17 +3491,16 @@ if EXECUTE_RENAME:
     # Create folders if needed
     japanese_dir = os.path.join(ARTICLES_DIR, 'japanese')
     research_dir = os.path.join(ARTICLES_DIR, 're-search')
-    alert_dir = os.path.join(ARTICLES_DIR, 'alert')
     failure_dir = os.path.join(ARTICLES_DIR, 'failure')
-    for folder in [japanese_dir, research_dir, alert_dir, failure_dir]:
+    for folder in [japanese_dir, research_dir, failure_dir]:
         if not os.path.exists(folder):
             os.makedirs(folder)
             print(f"Created directory: {folder}")
 
     renamed = []
+    renamed_alert = []  # Track alert files separately (for reference only)
     moved_japanese = []
     moved_research = []
-    moved_alert = []
     moved_failure = []
     errors = []
 
@@ -3521,22 +3523,6 @@ if EXECUTE_RENAME:
                     errors.append({'old': old_name, 'new': f'japanese/{old_name}', 'reason': 'path conflict'})
             except Exception as e:
                 errors.append({'old': old_name, 'new': f'japanese/{old_name}', 'reason': str(e)})
-            continue
-
-        # Handle alert papers - rename and move to alert folder (for human review)
-        if item.get('move_to_alert'):
-            new_name = item.get('new_filename') or old_name
-            new_path = os.path.join(alert_dir, new_name)
-            try:
-                if not os.path.exists(new_path):
-                    os.rename(old_path, new_path)
-                    moved_alert.append({'old': old_name, 'new': f'alert/{new_name}',
-                                       'alert_reason': item.get('alert_reason'),
-                                       'authors': item.get('final_authors')})
-                else:
-                    errors.append({'old': old_name, 'new': f'alert/{new_name}', 'reason': 'path conflict'})
-            except Exception as e:
-                errors.append({'old': old_name, 'new': f'alert/{new_name}', 'reason': str(e)})
             continue
 
         # Handle fail papers - move to failure folder (no rename)
@@ -3567,7 +3553,7 @@ if EXECUTE_RENAME:
                 errors.append({'old': old_name, 'new': f're-search/{new_name}', 'reason': str(e)})
             continue
 
-        # Handle regular renaming
+        # Handle regular renaming (includes alert files - they are renamed but tracked separately)
         new_name = item.get('new_filename')
 
         if not new_name or old_name == new_name:
@@ -3578,24 +3564,33 @@ if EXECUTE_RENAME:
         try:
             if not os.path.exists(new_path):
                 os.rename(old_path, new_path)
-                renamed.append({'old': old_name, 'new': new_name})
+                rename_entry = {'old': old_name, 'new': new_name}
+                renamed.append(rename_entry)
+                # Track alert files separately for reference
+                if item.get('is_alert'):
+                    renamed_alert.append({
+                        'old': old_name,
+                        'new': new_name,
+                        'alert_reason': item.get('alert_reason'),
+                        'authors': item.get('final_authors'),
+                        'author_source': item.get('author_source')
+                    })
             else:
                 errors.append({'old': old_name, 'new': new_name, 'reason': 'path conflict'})
         except Exception as e:
             errors.append({'old': old_name, 'new': new_name, 'reason': str(e)})
 
     print(f"\nRename complete:")
-    print(f"  Renamed: {len(renamed)}")
+    print(f"  Renamed: {len(renamed)} (including {len(renamed_alert)} alert files)")
     print(f"  Moved to japanese/: {len(moved_japanese)}")
-    print(f"  Moved to alert/: {len(moved_alert)}")
     print(f"  Moved to failure/: {len(moved_failure)}")
     print(f"  Moved to re-search/: {len(moved_research)}")
     print(f"  Errors: {len(errors)}")
 
-    # Show alert details
-    if moved_alert:
-        print(f"\n--- Alert files (require human review) ---")
-        for item in moved_alert[:20]:
+    # Show alert details (for reference)
+    if renamed_alert:
+        print(f"\n--- Alert files (renamed, for reference) ---")
+        for item in renamed_alert[:20]:
             print(f"  {item['old']} -> {item['new']}")
             print(f"    Reason: {item.get('alert_reason')}, Authors: {item.get('authors')}")
 
@@ -3603,13 +3598,24 @@ if EXECUTE_RENAME:
     with open(os.path.join(DATA_DIR, 'rename_results_final.json'), 'w') as f:
         json.dump({
             'renamed': renamed,
+            'renamed_alert': renamed_alert,
             'moved_japanese': moved_japanese,
-            'moved_alert': moved_alert,
             'moved_failure': moved_failure,
             'moved_research': moved_research,
             'errors': errors,
             'timestamp': datetime.now().isoformat()
         }, f, ensure_ascii=False, indent=2)
+
+    # Save alert list separately for reference
+    if renamed_alert:
+        with open(os.path.join(DATA_DIR, 'alert_files_list.json'), 'w') as f:
+            json.dump({
+                'description': 'Files renamed with low confidence (OCR+GPT fallback). Review if issues found.',
+                'count': len(renamed_alert),
+                'files': renamed_alert,
+                'timestamp': datetime.now().isoformat()
+            }, f, ensure_ascii=False, indent=2)
+        print(f"\nAlert list saved to {os.path.join(DATA_DIR, 'alert_files_list.json')}")
 else:
     print("EXECUTE_RENAME is False. Set to True to actually rename files.")
     print("Make sure you have a backup before proceeding!")
