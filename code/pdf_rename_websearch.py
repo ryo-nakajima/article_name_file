@@ -347,6 +347,7 @@ def is_valid_surname(name: str) -> bool:
     name = name.strip()
     name = re.sub(r'[:\.,;!?]+$', '', name)
 
+    # Length check: 2-20 chars (real surnames rarely exceed 15)
     if len(name) < 2 or len(name) > 20:
         return False
 
@@ -365,27 +366,48 @@ def is_valid_surname(name: str) -> bool:
         if len(name) > 8:
             return False
 
-    # Reject garbled/truncated names: unusual starting consonant clusters
-    # Be careful not to reject valid African/Asian names like "Ng", "Ndegwa"
     lower_name = name.lower()
+
+    # Reject concatenated title/English words (e.g., "Evidencefromradiologists")
+    # These have common English words embedded without spaces
+    if len(name) > 10:
+        embedded_words = ['from', 'with', 'the', 'and', 'for', 'evidence', 'analysis',
+                          'study', 'effect', 'model', 'data', 'using', 'based',
+                          'market', 'price', 'labor', 'trade', 'policy', 'average',
+                          'treatment', 'selection', 'patent', 'innovation', 'court',
+                          'experiment', 'estimat', 'causal', 'empiric']
+        for word in embedded_words:
+            idx = lower_name.find(word)
+            if idx > 0:  # Word is embedded (not at start)
+                return False
+
+    # Reject garbled/truncated names: unusual starting consonant clusters
+    # Be careful not to reject valid names like "McCrary", "Schwarzenegger", "Ng", "Ndegwa"
     if len(lower_name) >= 3:
         # Check for clearly invalid 3+ consonant clusters at start
         invalid_starts = ['ndf', 'xzx', 'zxz', 'qxq', 'vbv', 'bvb', 'kmt', 'pmt', 'bnt', 'dnt', 'fnt', 'gnt', 'hnt', 'lnt', 'mnt', 'pnt', 'rnt', 'tnt', 'wnt', 'znt']
         for inv in invalid_starts:
             if lower_name.startswith(inv):
                 return False
-        # Also reject if starts with more than 3 consonants in a row
-        if re.match(r'^[bcdfghjklmnpqrstvwxz]{4,}', lower_name):
+        # Relaxed: reject only if starts with 5+ consonants (was 4)
+        # This allows: McCr, Schw, Strz, etc.
+        if re.match(r'^[bcdfghjklmnpqrstvwxz]{5,}', lower_name):
             return False
 
     # Check minimum vowel ratio for longer names (names need vowels!)
-    if len(lower_name) >= 5:
+    # Relaxed: 10% threshold (was 15%) to allow names like "Thursby" (1/7 = 14%)
+    if len(lower_name) >= 6:  # Only check for longer names
         vowels = sum(1 for c in lower_name if c in 'aeiou')
-        if vowels < len(lower_name) * 0.15:  # Less than 15% vowels is suspicious
+        if vowels < len(lower_name) * 0.10:  # Less than 10% vowels is suspicious
             return False
 
-    # Reject if starts with lowercase (after stripping)
-    if name and name[0].islower():
+    # Handle lowercase prefixes (de, d', van, von, di, la, le, el, al, etc.)
+    # These are valid surname prefixes in many cultures
+    lowercase_prefixes = ['de ', "d'", 'van ', 'von ', 'di ', 'da ', 'la ', 'le ', 'el ', 'al ', 'del ', 'della ', 'lo ', 'den ', 'ter ', 'ten ']
+    starts_with_valid_prefix = any(name.lower().startswith(p) for p in lowercase_prefixes)
+
+    # Reject if starts with lowercase, UNLESS it's a valid prefix
+    if name and name[0].islower() and not starts_with_valid_prefix:
         return False
 
     return True
@@ -1162,6 +1184,48 @@ def extract_title_with_gpt(text: str, max_chars: int = 3000) -> Optional[str]:
     if not text or len(text) < 50:
         return None
 
+    # Skip copyright/boilerplate pages (JSTOR, NBER, etc.)
+    # These often appear at the start of scanned PDFs
+    boilerplate_indicators = [
+        'collaborating with jstor',
+        'jstor is a not-for-profit',
+        'accessed:',
+        'your use of the jstor archive',
+        'terms and conditions',
+        'please contact jstor',
+        'this content downloaded',
+        'all use subject to',
+        'nber working paper',
+        'working paper no.',
+        'discussion paper no.'
+    ]
+
+    text_lower = text[:2000].lower()
+    is_boilerplate = any(ind in text_lower for ind in boilerplate_indicators)
+
+    if is_boilerplate:
+        # Try to find actual content after boilerplate (look for double newlines)
+        # Often the real content starts after the first page
+        parts = text.split('\n\n\n')
+        if len(parts) > 1:
+            # Skip the first part (boilerplate) and use the rest
+            text = '\n\n'.join(parts[1:])
+        else:
+            # Try splitting by page markers or common patterns
+            for marker in ['Abstract', 'ABSTRACT', 'Introduction', 'INTRODUCTION', '1.', '1 ']:
+                if marker in text:
+                    idx = text.index(marker)
+                    if idx > 100:  # Make sure we're not at the very beginning
+                        # Look for title before the marker
+                        pre_text = text[:idx]
+                        # Find the last substantial paragraph before Abstract
+                        lines = [l.strip() for l in pre_text.split('\n') if l.strip()]
+                        # Take last few significant lines as potential title area
+                        title_candidates = [l for l in lines[-10:] if len(l) > 20 and not any(bi in l.lower() for bi in boilerplate_indicators)]
+                        if title_candidates:
+                            text = '\n'.join(title_candidates) + '\n' + text[idx:idx+500]
+                            break
+
     # Truncate text to control costs
     truncated_text = text[:max_chars]
 
@@ -1174,6 +1238,7 @@ Rules:
 - Return ONLY the title, nothing else
 - The title is usually in larger font, near the top (but not the very top which is often journal name)
 - Do NOT include author names, journal names, volume/issue numbers, or dates
+- IGNORE copyright notices, JSTOR collaboration text, terms of use, etc.
 - If you cannot find a clear title, return "NONE"
 - Return the title exactly as written (preserve capitalization)"""
         },
@@ -1196,6 +1261,11 @@ Rules:
     # Clean up the title
     title = re.sub(r'^["\'"]|["\'"]$', '', title)  # Remove quotes
     title = re.sub(r'[\d\*†‡§¶]+$', '', title).strip()
+
+    # Reject if title looks like boilerplate
+    title_lower = title.lower()
+    if any(ind in title_lower for ind in boilerplate_indicators):
+        return None
 
     return title if len(title) >= 15 else None
 
@@ -1375,19 +1445,26 @@ Rules for YEAR:
     return None, [], None
 
 
-def validate_surnames_with_gpt(surnames: List[str], title: str = None) -> Tuple[List[str], bool]:
+def validate_surnames_with_gpt(surnames: List[str], title: str = None, trust_source: bool = True) -> Tuple[List[str], bool]:
     """
     Use GPT to validate if extracted names are valid surnames.
 
     Args:
         surnames: List of potential surnames to validate
         title: Optional paper title for context
+        trust_source: If True (default), fallback to original if GPT returns empty.
+                      Set to False for untrusted sources (metadata, OCR) to be stricter.
 
     Returns:
         (validated_surnames, all_valid): List of valid surnames and whether all passed
     """
     if not surnames:
         return [], True
+
+    # Pre-filter: keep only names that pass basic validation
+    original_valid = [s for s in surnames if is_valid_surname(s)]
+    if not original_valid:
+        return [], True  # Nothing to validate
 
     # Build context
     context = f"Paper title: {title}\n" if title else ""
@@ -1396,24 +1473,35 @@ def validate_surnames_with_gpt(surnames: List[str], title: str = None) -> Tuple[
     messages = [
         {
             "role": "system",
-            "content": """You are validating and correcting author surnames for academic papers.
-Return JSON: {"valid_surnames": ["Corrected1", "Corrected2"], "invalid": ["Original1"], "reason": "explanation"}
+            "content": """You are validating author surnames for academic papers.
+Return JSON: {"valid_surnames": ["Name1", "Name2"], "invalid": ["Bad1"], "reason": "explanation"}
 
-IMPORTANT: Return CORRECTED surnames in valid_surnames, not the original invalid ones.
+CRITICAL - REJECT these patterns:
+1. CONCATENATED TITLE WORDS: Words from paper titles joined without spaces
+   - "Evidencefromradiologists" → INVALID (title fragment "Evidence from radiologists")
+   - "Evidencefromthecourts" → INVALID (title fragment "Evidence from the courts")
+   - "EstimatingAverage" → INVALID (title fragment "Estimating Average")
+   - "Patentsandcumulative" → INVALID (title fragment)
+   - "Selectionwithvariation" → INVALID (title fragment)
 
-Rules:
-- Valid surnames are family/last names (e.g., "Smith", "Arkhangelsky", "DeStefano", "O'Brien")
-- CORRECT concatenated names: "JonathanRoth" → return "Roth" in valid_surnames
-- CORRECT concatenated names: "JonathanRotha" → return "Roth" in valid_surnames (remove trailing 'a')
-- REJECT first names with no surname: "Jonathan" alone → invalid, return []
-- REJECT title words: "Uncertainty", "Herding", "Citation" → invalid
-- REJECT garbled text: "Ndfirm", "Enough" → invalid (unless you can identify the real surname)
-- REJECT institution words: "Administrator", "University" → invalid
+2. EMBEDDED ENGLISH WORDS: Names containing common words in the middle
+   - Any name with "from", "with", "the", "and" embedded → INVALID
+   - Any name with "evidence", "effect", "model", "market", "policy" embedded → INVALID
+
+3. OBVIOUS NON-SURNAMES:
+   - First names alone: "Jonathan", "David" → INVALID
+   - Institutions: "University", "Institute" → INVALID
+   - Title words: "Economics", "Analysis" → INVALID
+
+VALID surnames:
+- Normal surnames: "Smith", "McCrary", "Thursby", "Nakamura"
+- With prefixes: "de Chaisemartin", "van der Berg", "O'Brien"
+- Concatenated first+last: "JonathanRoth" → extract "Roth" only
 
 Examples:
-- Input: ["JonathanRotha"] → {"valid_surnames": ["Roth"], "invalid": ["JonathanRotha"], "reason": "extracted surname from concatenated name"}
-- Input: ["Smith", "Enough"] → {"valid_surnames": ["Smith"], "invalid": ["Enough"], "reason": "Enough is not a valid surname"}
-- Input: ["Dmitry", "Guido"] → {"valid_surnames": [], "invalid": ["Dmitry", "Guido"], "reason": "these are first names, not surnames"}"""
+- ["Evidencefromradiologists"] → {"valid_surnames": [], "invalid": ["Evidencefromradiologists"], "reason": "concatenated title words"}
+- ["McCrary"] → {"valid_surnames": ["McCrary"], "invalid": [], "reason": "valid surname"}
+- ["JonathanRoth"] → {"valid_surnames": ["Roth"], "invalid": [], "reason": "extracted surname from concatenated name"}"""
         },
         {
             "role": "user",
@@ -1442,6 +1530,11 @@ Examples:
             valid = [normalize_case(s) for s in valid if s and isinstance(s, str)]
             valid = [s for s in valid if s and is_valid_surname(s)]
 
+            # FALLBACK: Only if trust_source=True (WebSearch results)
+            # For untrusted sources, accept GPT's judgment even if empty
+            if not valid and original_valid and trust_source:
+                return original_valid, False
+
             all_valid = len(invalid) == 0 and len(valid) == len(surnames)
 
             return valid, all_valid
@@ -1455,12 +1548,12 @@ Examples:
                     time.sleep(delay)
                 else:
                     # On rate limit failure, return original with warning
-                    return surnames, False
+                    return original_valid if original_valid else surnames, False
             else:
                 print(f"GPT surname validation error: {e}")
-                return surnames, False
+                return original_valid if original_valid else surnames, False
 
-    return surnames, False
+    return original_valid if original_valid else surnames, False
 
 
 print("GPT functions defined.")
@@ -2338,6 +2431,106 @@ def websearch_authors(title: str) -> Tuple[List[str], Optional[str], str]:
 print("WebSearch functions defined. Using Semantic Scholar + CrossRef fallback.")
 
 # %%
+# Cell 5.5: Reset files with bad title extraction (JSTOR boilerplate problem)
+# - Identifies files where title extraction captured copyright text instead of real title
+# - Resets these entries so they will be reprocessed with improved extraction
+
+RESET_BAD_TITLES = True  # Set to False to skip this step
+
+if RESET_BAD_TITLES:
+    print("\n=== Cell 5.5: Resetting files with bad title extraction ===")
+
+    # Load progress to check for bad titles
+    progress_check = load_progress()
+
+    # Boilerplate indicators that should NOT appear in titles
+    bad_title_indicators = [
+        'collaborating with jstor',
+        'jstor is a not-for-profit',
+        'american economic association is collaborating',
+        'your use of the jstor archive',
+        'terms and conditions',
+        'this content downloaded',
+        'all use subject to',
+        'accessed:',
+        'please contact jstor'
+    ]
+
+    # Also identify files that all got the same wrong authors (Bernstein problem)
+    author_counts = {}
+    for h, entry in progress_check['by_hash'].items():
+        fa = tuple(entry.get('final_authors', []))
+        fy = entry.get('final_year')
+        if fa and fy:
+            key = (fa, fy)
+            if key not in author_counts:
+                author_counts[key] = []
+            author_counts[key].append(h)
+
+    # Find author/year combinations with suspiciously many files (>5 is suspicious)
+    suspicious_combos = {k: v for k, v in author_counts.items() if len(v) > 5}
+
+    reset_count = 0
+    reset_hashes = set()
+
+    # Reset files with bad title indicators
+    for file_hash, entry in progress_check['by_hash'].items():
+        title = entry.get('title', '').lower()
+        should_reset = False
+
+        # Check for boilerplate in title
+        if any(ind in title for ind in bad_title_indicators):
+            should_reset = True
+
+        # Check for suspicious author/year combo
+        fa = tuple(entry.get('final_authors', []))
+        fy = entry.get('final_year')
+        if (fa, fy) in suspicious_combos:
+            should_reset = True
+
+        # Check for concatenated title words used as authors
+        # e.g., "Evidencefromradiologists", "Evidencefromthecourts"
+        embedded_words = ['from', 'with', 'evidence', 'effect', 'model',
+                          'market', 'policy', 'average', 'treatment',
+                          'selection', 'patent', 'innovation', 'court',
+                          'experiment', 'estimat', 'causal', 'empiric']
+        for author in entry.get('final_authors', []):
+            if author and len(author) > 10:
+                author_lower = author.lower()
+                for word in embedded_words:
+                    if word in author_lower and author_lower.find(word) > 0:
+                        should_reset = True
+                        break
+
+        if should_reset:
+            reset_hashes.add(file_hash)
+            reset_count += 1
+
+    if reset_count > 0:
+        print(f"Found {reset_count} files with bad title extraction")
+        print(f"Suspicious author/year combos (>5 files):")
+        for (authors, year), hashes in suspicious_combos.items():
+            print(f"  {authors} {year}: {len(hashes)} files")
+
+        # Reset these entries
+        for file_hash in reset_hashes:
+            if file_hash in progress_check['by_hash']:
+                # Keep minimal info, reset everything else for reprocessing
+                entry = progress_check['by_hash'][file_hash]
+                progress_check['by_hash'][file_hash] = {
+                    'filename': entry.get('filename'),
+                    'file_hash': file_hash,
+                    'reset_reason': 'bad_title_extraction',
+                    'original_title': entry.get('title', '')[:50] + '...' if entry.get('title') else None
+                }
+
+        save_progress(progress_check)
+        print(f"Reset {reset_count} entries for reprocessing")
+    else:
+        print("No files with bad title extraction found")
+
+
+# %%
 # Cell 6: Step 1 - Extract titles and metadata from PDFs (INCREMENTAL)
 # - Loads existing progress and skips already processed files
 # - Uses file hash for identification (survives renames)
@@ -2860,6 +3053,68 @@ print(f"  Japanese: {japanese_count}")
 
 
 # %%
+# Cell 9.6: Apply existing OCR+GPT results that weren't applied
+# - Finds files where ocr_gpt_authors exists but final_authors is empty
+# - Applies the OCR+GPT results and changes status to alert
+
+print("\n=== Cell 9.6: Apply existing OCR+GPT results ===")
+
+ocr_results_applied = 0
+for item in pdf_data:
+    ocr_authors = item.get('ocr_gpt_authors', [])
+    final_authors = item.get('final_authors', [])
+    status = item.get('status')
+
+    # If we have OCR+GPT authors but no final_authors, apply them
+    if ocr_authors and not final_authors and status == 'fail':
+        # Validate the OCR authors
+        valid_authors = [a for a in ocr_authors if is_valid_surname(a)]
+        if valid_authors:
+            item['final_authors'] = valid_authors
+            item['author_source'] = 'ocr_gpt_fallback_recovered'
+
+            # Also apply year if available
+            ocr_year = item.get('ocr_gpt_year')
+            if ocr_year and not item.get('final_year'):
+                item['final_year'] = ocr_year
+                item['year_source'] = 'ocr_gpt_fallback'
+
+            # Change status to alert
+            if item.get('final_year'):
+                item['status'] = 'alert'
+                item['alert_reason'] = 'ocr_gpt_recovered'
+                if 'fail_reason' in item:
+                    del item['fail_reason']
+                ocr_results_applied += 1
+                print(f"  Applied: {item['filename']} → {valid_authors}")
+
+print(f"\nApplied OCR+GPT results to {ocr_results_applied} files")
+
+# Update progress
+for item in pdf_data:
+    file_hash = item.get('file_hash', '')
+    if file_hash and file_hash in progress['by_hash']:
+        progress['by_hash'][file_hash].update({
+            'status': item['status'],
+            'final_authors': item.get('final_authors'),
+            'final_year': item.get('final_year'),
+            'author_source': item.get('author_source'),
+            'alert_reason': item.get('alert_reason'),
+            'fail_reason': item.get('fail_reason')
+        })
+save_progress(progress)
+
+# Update counts
+success_count = sum(1 for x in pdf_data if x['status'] == 'success')
+fail_count = sum(1 for x in pdf_data if x['status'] == 'fail')
+alert_count = sum(1 for x in pdf_data if x['status'] == 'alert')
+print(f"\nStatus after applying OCR+GPT results:")
+print(f"  Success: {success_count}")
+print(f"  Alert: {alert_count}")
+print(f"  Fail: {fail_count}")
+
+
+# %%
 # Cell 10: Generate new filenames
 
 def generate_filename(authors: List[str], year: str, existing: set) -> Optional[str]:
@@ -2902,12 +3157,45 @@ def generate_filename(authors: List[str], year: str, existing: set) -> Optional[
     return None
 
 
-# Generate new names
+# Generate new names with GPT validation as final check
 existing = set()
+GPT_FINAL_VALIDATION = True  # Final GPT check before renaming
 
-for item in pdf_data:
+print("Generating filenames...")
+if GPT_FINAL_VALIDATION:
+    print("  GPT final validation enabled")
+
+gpt_rejected_count = 0
+
+for i, item in enumerate(pdf_data):
+    if (i + 1) % 200 == 0:
+        print(f"  Processing {i+1}/{len(pdf_data)}...")
+
     if item['status'] == 'success':
-        new_name = generate_filename(item['final_authors'], item['final_year'], existing)
+        authors = item.get('final_authors', [])
+        title = item.get('title', '')
+
+        # Final GPT validation for non-websearch sources
+        # WebSearch (CrossRef, Semantic Scholar) is trusted
+        author_source = item.get('author_source', '')
+        if GPT_FINAL_VALIDATION and authors and author_source not in ('websearch',):
+            validated, _ = validate_surnames_with_gpt(authors, title, trust_source=False)
+            if not validated:
+                # GPT rejected all authors - move to fail
+                item['status'] = 'fail'
+                item['fail_reason'] = 'gpt_final_validation_failed'
+                item['gpt_rejected_authors'] = authors
+                item['new_filename'] = None
+                item['move_to_failure'] = True
+                gpt_rejected_count += 1
+                continue
+            elif validated != authors:
+                # GPT corrected authors
+                item['final_authors'] = validated
+                item['gpt_final_corrected'] = True
+                authors = validated
+
+        new_name = generate_filename(authors, item['final_year'], existing)
         if new_name:
             item['new_filename'] = new_name
             existing.add(new_name.lower())
@@ -2915,20 +3203,35 @@ for item in pdf_data:
             item['new_filename'] = None
             item['status'] = 'fail'
             item['fail_reason'] = 'filename_generation_failed'
+
     elif item['status'] == 'alert':
+        authors = item.get('final_authors', [])
+        title = item.get('title', '')
+
+        # GPT validation for alert files too
+        if GPT_FINAL_VALIDATION and authors:
+            validated, _ = validate_surnames_with_gpt(authors, title, trust_source=False)
+            if validated:
+                item['final_authors'] = validated
+                authors = validated
+
         # Alert: generate filename and move to alert/ directory for human review
-        new_name = generate_filename(item['final_authors'], item['final_year'], existing)
+        new_name = generate_filename(authors, item['final_year'], existing)
         if new_name:
             item['new_filename'] = new_name
             existing.add(new_name.lower())
         else:
             item['new_filename'] = None
         item['move_to_alert'] = True
+
     elif item['status'] == 'fail':
         # Fail: no filename, move to failure/ directory
         item['new_filename'] = None
         item['move_to_failure'] = True
     # Japanese files keep their original name and move to japanese/
+
+if GPT_FINAL_VALIDATION:
+    print(f"  GPT rejected {gpt_rejected_count} files with invalid authors")
 
 success_count = sum(1 for x in pdf_data if x['status'] == 'success' and x.get('new_filename'))
 alert_count = sum(1 for x in pdf_data if x.get('move_to_alert'))
@@ -3188,16 +3491,89 @@ print(json.dumps(summary, indent=2))
 
 
 # %%
-# Cell 14: Detect and move duplicate files
+# Cell 14: Detect and move duplicate files (Enhanced with content-based detection)
 # - Finds files like Name_Year.pdf, Name_Year_a.pdf, Name_Year_b.pdf
-# - Compares MD5 hashes to detect identical content
-# - Moves duplicates (_a, _b, etc.) to duplicate/ folder
-# - Keeps the base file (without suffix)
+# - Uses both MD5 hash AND text similarity (80% threshold, chars 500-2500)
+# - Keeps the file with more extractable text
+# - Detects Working Papers and renames with _wp suffix
+# - Re-evaluates existing files in duplicate/ folder
 
 DETECT_DUPLICATES = True  # Set to False to skip duplicate detection
+SIMILARITY_THRESHOLD = 0.80  # 80% text similarity threshold
+TEXT_START = 500  # Start character position for comparison
+TEXT_END = 2500   # End character position for comparison
+
+# Working Paper keywords to detect
+WP_KEYWORDS = [
+    'working paper',
+    'discussion paper',
+    'nber working',
+    'nber wp',
+    'cepr discussion',
+    'iza discussion',
+    'ssrn',
+    'preliminary draft',
+    'do not cite',
+    'work in progress'
+]
+
+
+def extract_pdf_text_for_comparison(pdf_path: str, max_chars: int = 3000) -> str:
+    """Extract text from PDF for comparison (first max_chars characters)."""
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            text = ""
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                text += page_text
+                if len(text) >= max_chars:
+                    break
+            return text[:max_chars]
+    except Exception as e:
+        return ""
+
+
+def calculate_text_similarity(text1: str, text2: str, start: int = 500, end: int = 2500) -> float:
+    """
+    Calculate similarity between two texts using the specified character range.
+    Returns similarity ratio between 0 and 1.
+    """
+    # Extract the comparison range
+    segment1 = text1[start:end].lower().strip()
+    segment2 = text2[start:end].lower().strip()
+
+    # If either segment is too short, return 0
+    if len(segment1) < 100 or len(segment2) < 100:
+        return 0.0
+
+    # Use difflib for sequence matching
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, segment1, segment2).ratio()
+
+
+def is_working_paper(text: str, max_check_chars: int = 3000) -> bool:
+    """Check if PDF text contains Working Paper indicators."""
+    check_text = text[:max_check_chars].lower()
+    return any(kw in check_text for kw in WP_KEYWORDS)
+
+
+def count_extractable_text(pdf_path: str) -> int:
+    """Count total extractable text length from PDF."""
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            total = 0
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                total += len(page_text)
+            return total
+    except Exception as e:
+        return 0
+
 
 if DETECT_DUPLICATES:
-    print("=== Detecting duplicate files ===")
+    print("=== Detecting duplicate files (Enhanced) ===")
+    print(f"  Similarity threshold: {SIMILARITY_THRESHOLD*100:.0f}%")
+    print(f"  Text comparison range: chars {TEXT_START}-{TEXT_END}")
 
     # Create duplicate folder
     duplicate_dir = os.path.join(ARTICLES_DIR, 'duplicate')
@@ -3205,12 +3581,44 @@ if DETECT_DUPLICATES:
         os.makedirs(duplicate_dir)
         print(f"Created directory: {duplicate_dir}")
 
-    # Get all PDF files in ARTICLES_DIR (not subfolders)
+    # --- Step 1: Re-evaluate existing duplicate/ files ---
+    print("\n--- Re-evaluating existing duplicate/ files ---")
+    existing_duplicates = [f for f in os.listdir(duplicate_dir)
+                          if f.lower().endswith('.pdf') and os.path.isfile(os.path.join(duplicate_dir, f))]
+    print(f"  Found {len(existing_duplicates)} files in duplicate/")
+
+    restored_files = []
+    for dup_file in existing_duplicates:
+        # Extract base name to find potential match in ARTICLES_DIR
+        match = re.match(r'^(.+?)(_[a-z])?(_wp)?\.pdf$', dup_file, re.IGNORECASE)
+        if not match:
+            continue
+
+        base_name = match.group(1)
+        dup_path = os.path.join(duplicate_dir, dup_file)
+
+        # Find matching files in ARTICLES_DIR
+        potential_matches = [f for f in os.listdir(ARTICLES_DIR)
+                           if f.lower().endswith('.pdf')
+                           and f.startswith(base_name)
+                           and os.path.isfile(os.path.join(ARTICLES_DIR, f))]
+
+        if not potential_matches:
+            # No match found, restore the file
+            restore_path = os.path.join(ARTICLES_DIR, dup_file.replace('_wp.pdf', '.pdf'))
+            if not os.path.exists(restore_path):
+                os.rename(dup_path, restore_path)
+                restored_files.append(dup_file)
+                print(f"  Restored: {dup_file} (no matching base file)")
+
+    if restored_files:
+        print(f"  Restored {len(restored_files)} files to ARTICLES_DIR")
+
+    # --- Step 2: Get all PDF files in ARTICLES_DIR ---
     pdf_files = [f for f in os.listdir(ARTICLES_DIR)
                  if f.lower().endswith('.pdf') and os.path.isfile(os.path.join(ARTICLES_DIR, f))]
 
     # Group files by base name (without _a, _b, etc. suffix)
-    # Pattern: Name_Year.pdf, Name_Year_a.pdf, Name_Year_b.pdf, etc.
     file_groups = {}  # base_name -> list of (filename, suffix_order)
 
     for filename in pdf_files:
@@ -3233,56 +3641,123 @@ if DETECT_DUPLICATES:
 
     # Find groups with potential duplicates (more than one file)
     duplicate_candidates = {k: v for k, v in file_groups.items() if len(v) > 1}
-    print(f"Found {len(duplicate_candidates)} file groups with potential duplicates")
+    print(f"\n--- Processing {len(duplicate_candidates)} file groups with potential duplicates ---")
 
-    # Check for actual duplicates using MD5 hash
+    # --- Step 3: Check for duplicates using MD5 hash AND text similarity ---
     moved_duplicates = []
+    hash_matches = 0
+    similarity_matches = 0
 
     for base_name, files in duplicate_candidates.items():
         # Sort by order (base file first, then _a, _b, etc.)
         files.sort(key=lambda x: x[1])
 
-        # Calculate hashes for all files in the group
-        file_hashes = {}  # filename -> hash
+        # Calculate hashes and extract text for all files
+        file_data = {}  # filename -> {'hash': ..., 'text': ..., 'text_len': ...}
         for filename, _ in files:
             path = os.path.join(ARTICLES_DIR, filename)
             file_hash = calculate_file_hash(path)
-            file_hashes[filename] = file_hash
+            text = extract_pdf_text_for_comparison(path)
+            text_len = count_extractable_text(path)
+            file_data[filename] = {
+                'hash': file_hash,
+                'text': text,
+                'text_len': text_len,
+                'is_wp': is_working_paper(text)
+            }
 
-        # The base file (first one, order=0 or lowest order) is kept
-        base_file = files[0][0]
-        base_hash = file_hashes[base_file]
+        # Find the best file to keep (most extractable text)
+        best_file = max(files, key=lambda x: file_data[x[0]]['text_len'])[0]
+        best_data = file_data[best_file]
 
-        # Check if other files are duplicates of the base file
-        for filename, order in files[1:]:
-            if file_hashes[filename] == base_hash:
-                # This is a duplicate - move to duplicate folder
+        # Compare all other files against the best file
+        for filename, order in files:
+            if filename == best_file:
+                continue
+
+            current_data = file_data[filename]
+            is_duplicate = False
+            match_type = None
+
+            # Check 1: MD5 hash match (exact duplicate)
+            if current_data['hash'] == best_data['hash']:
+                is_duplicate = True
+                match_type = 'hash'
+                hash_matches += 1
+
+            # Check 2: Text similarity match (content-based duplicate)
+            elif best_data['text'] and current_data['text']:
+                similarity = calculate_text_similarity(
+                    best_data['text'], current_data['text'],
+                    TEXT_START, TEXT_END
+                )
+                if similarity >= SIMILARITY_THRESHOLD:
+                    is_duplicate = True
+                    match_type = f'similarity:{similarity:.1%}'
+                    similarity_matches += 1
+
+            if is_duplicate:
+                # Determine if this is a Working Paper
+                is_wp = current_data['is_wp']
+
+                # Determine new filename
+                if is_wp:
+                    # Rename with _wp suffix
+                    new_filename = re.sub(r'(_[a-z])?\.pdf$', '_wp.pdf', filename, flags=re.IGNORECASE)
+                else:
+                    new_filename = filename
+
                 old_path = os.path.join(ARTICLES_DIR, filename)
-                new_path = os.path.join(duplicate_dir, filename)
+                new_path = os.path.join(duplicate_dir, new_filename)
 
                 try:
-                    if os.path.exists(old_path) and not os.path.exists(new_path):
+                    # Handle existing file in duplicate/
+                    if os.path.exists(new_path):
+                        # Add timestamp to avoid overwrite
+                        base, ext = os.path.splitext(new_filename)
+                        new_filename = f"{base}_{datetime.now().strftime('%H%M%S')}{ext}"
+                        new_path = os.path.join(duplicate_dir, new_filename)
+
+                    if os.path.exists(old_path):
                         os.rename(old_path, new_path)
                         moved_duplicates.append({
-                            'filename': filename,
-                            'base_file': base_file,
-                            'hash': base_hash
+                            'original_filename': filename,
+                            'moved_filename': new_filename,
+                            'base_file': best_file,
+                            'match_type': match_type,
+                            'is_wp': is_wp,
+                            'text_len': current_data['text_len'],
+                            'best_text_len': best_data['text_len']
                         })
-                        print(f"  Moved duplicate: {filename} (same as {base_file})")
+                        wp_tag = " [WP]" if is_wp else ""
+                        print(f"  Moved: {filename} -> {new_filename}{wp_tag} ({match_type}, kept {best_file})")
                 except Exception as e:
                     print(f"  Error moving {filename}: {e}")
 
-    print(f"\nDuplicate detection complete:")
-    print(f"  Moved to duplicate/: {len(moved_duplicates)}")
+    print(f"\n=== Duplicate detection complete ===")
+    print(f"  Hash matches: {hash_matches}")
+    print(f"  Similarity matches: {similarity_matches}")
+    print(f"  Total moved to duplicate/: {len(moved_duplicates)}")
 
     # Save duplicate info to JSON
-    if moved_duplicates:
-        duplicate_info = {
-            'moved_duplicates': moved_duplicates,
-            'timestamp': datetime.now().isoformat()
-        }
-        with open(os.path.join(DATA_DIR, 'duplicate_files.json'), 'w') as f:
-            json.dump(duplicate_info, f, ensure_ascii=False, indent=2)
-        print(f"  Saved info to duplicate_files.json")
+    duplicate_info = {
+        'moved_duplicates': moved_duplicates,
+        'restored_files': restored_files,
+        'settings': {
+            'similarity_threshold': SIMILARITY_THRESHOLD,
+            'text_range': [TEXT_START, TEXT_END],
+            'wp_keywords': WP_KEYWORDS
+        },
+        'statistics': {
+            'hash_matches': hash_matches,
+            'similarity_matches': similarity_matches,
+            'total_moved': len(moved_duplicates),
+            'restored': len(restored_files)
+        },
+        'timestamp': datetime.now().isoformat()
+    }
+    with open(os.path.join(DATA_DIR, 'duplicate_files.json'), 'w') as f:
+        json.dump(duplicate_info, f, ensure_ascii=False, indent=2)
+    print(f"  Saved info to duplicate_files.json")
 else:
     print("Duplicate detection skipped (DETECT_DUPLICATES = False)")
