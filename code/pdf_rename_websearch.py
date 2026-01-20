@@ -427,6 +427,59 @@ def normalize_case(name: str) -> Optional[str]:
     return name
 
 
+def parse_existing_filename(filename: str) -> Tuple[List[str], Optional[str], bool]:
+    """
+    Parse existing filename to extract authors and year if it follows academic naming convention.
+
+    Patterns recognized:
+    - Author_Year.pdf
+    - Author_Author_Year.pdf
+    - Author_et_al_Year.pdf
+    - Author_Year_a.pdf (with suffix)
+
+    Returns:
+        (authors, year, is_valid_format)
+    """
+    if not filename.lower().endswith('.pdf'):
+        return [], None, False
+
+    base = filename[:-4]  # Remove .pdf
+
+    # Remove trailing suffix like _a, _b, _c
+    suffix_match = re.match(r'^(.+)_([a-z])$', base)
+    if suffix_match:
+        base = suffix_match.group(1)
+
+    # Pattern 1: Author_et_al_Year
+    et_al_match = re.match(r'^([A-Z][a-zA-Z\u00C0-\u024F]+)_et_al_(\d{4})$', base)
+    if et_al_match:
+        author = et_al_match.group(1)
+        year = et_al_match.group(2)
+        if is_valid_surname(author):
+            return [author], year, True
+
+    # Pattern 2: Author(_Author)*_Year
+    # Split by underscore and check if last part is year
+    parts = base.split('_')
+    if len(parts) >= 2:
+        potential_year = parts[-1]
+        if re.match(r'^\d{4}$', potential_year):
+            authors = parts[:-1]
+            # Validate all authors
+            valid_authors = []
+            for a in authors:
+                # Skip 'et' and 'al' as they're part of et_al pattern
+                if a.lower() in ('et', 'al'):
+                    continue
+                if is_valid_surname(a):
+                    valid_authors.append(a)
+
+            if valid_authors:
+                return valid_authors, potential_year, True
+
+    return [], None, False
+
+
 def find_title_candidates(page, max_candidates: int = 5) -> List[Dict]:
     """
     Find title candidates using multiple indicators with flexible scoring.
@@ -1268,6 +1321,86 @@ Rules:
         return None
 
     return title if len(title) >= 15 else None
+
+
+def normalize_title_with_gpt(raw_title: str) -> Optional[str]:
+    """
+    Use GPT to normalize a garbled/concatenated title into proper format.
+
+    Handles:
+    - Missing spaces: "TAXATIONANDINNOVATION" -> "Taxation and Innovation"
+    - Mixed case issues: "AnAnalysisOfMarkets" -> "An Analysis of Markets"
+    - Special characters: "∗†‡" removal
+    - Author names embedded in title extraction
+
+    Args:
+        raw_title: The raw/garbled title text
+
+    Returns:
+        Normalized title or None if cannot be normalized
+    """
+    if not raw_title or len(raw_title) < 10:
+        return None
+
+    # Skip if already looks clean (has normal spacing)
+    words = raw_title.split()
+    if len(words) >= 3 and all(len(w) < 25 for w in words):
+        # Already has reasonable word structure
+        return raw_title
+
+    messages = [
+        {
+            "role": "system",
+            "content": """You are an expert at reconstructing academic paper titles from garbled text.
+
+The input may have:
+- Missing spaces between words (e.g., "TAXATIONANDINNOVATION" -> "Taxation and Innovation")
+- Concatenated author names at the end (e.g., "...CENTURY U A FUK KCIGIT" -> remove author parts)
+- Special symbols (∗, †, ‡, §) that should be removed
+- ALL CAPS that should be converted to Title Case
+
+Your task:
+1. Insert spaces where words were concatenated
+2. Remove any author names that got merged with the title
+3. Remove special symbols and footnote markers
+4. Return ONLY the reconstructed paper title in proper Title Case
+5. If you cannot determine a valid title, return "INVALID"
+
+Examples:
+Input: "TAXATIONANDINNOVATIONINTHE ∗ TWENTIETHCENTURY U A FUK KCIGIT"
+Output: "Taxation and Innovation in the Twentieth Century"
+
+Input: "ESTIMATINGDYNAMICDISCRETECHOICEMODELSWITHHYPERBOLIC"
+Output: "Estimating Dynamic Discrete Choice Models with Hyperbolic Discounting"
+"""
+        },
+        {
+            "role": "user",
+            "content": f"Reconstruct this title:\n{raw_title[:500]}"
+        }
+    ]
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=messages,
+            temperature=0,
+            max_tokens=200
+        )
+        result = response.choices[0].message.content.strip()
+
+        if result == "INVALID" or len(result) < 10:
+            return None
+
+        # Clean up result
+        result = re.sub(r'^["\'"]|["\'"]$', '', result)
+        result = re.sub(r'[\*†‡§¶]+', '', result).strip()
+
+        return result if len(result) >= 15 else None
+
+    except Exception as e:
+        print(f"    GPT title normalization error: {e}")
+        return None
 
 
 def validate_surnames_with_gpt(names: List[str]) -> List[str]:
@@ -2710,16 +2843,69 @@ print(f"Files to search: {len(to_search)}")
 print(f"Already searched: {already_searched}")
 print(f"Skipping: {japanese_count} Japanese, {no_title_count} no title")
 
-# Process WebSearch
+# Process WebSearch with filename parsing and title normalization
 search_count = 0
+filename_verified_count = 0
+title_normalized_count = 0
+
 for i, file_hash in enumerate(to_search):
     entry = progress['by_hash'][file_hash]
+    filename = entry['filename']
 
     if (i + 1) % 10 == 0:
-        print(f"Searching {i+1}/{len(to_search)}... ({entry['filename'][:30]})")
+        print(f"Searching {i+1}/{len(to_search)}... ({filename[:30]})")
 
-    # Perform WebSearch (Semantic Scholar -> CrossRef fallback)
-    ws_authors, ws_year, ws_source = websearch_authors(entry['title'])
+    # Step 1: Check if filename already follows Author_Year.pdf format
+    fn_authors, fn_year, is_valid_format = parse_existing_filename(filename)
+
+    if is_valid_format and fn_authors:
+        # Filename looks valid - try to verify with WebSearch using first author
+        # Search with author name + year to confirm paper exists
+        verify_query = f"{fn_authors[0]} {fn_year}"
+        ws_authors, ws_year, ws_source = websearch_authors(entry.get('title') or verify_query)
+
+        if ws_authors:
+            # WebSearch found results - check if they match filename
+            ws_surnames = [a.lower() for a in ws_authors]
+            fn_surnames = [a.lower() for a in fn_authors]
+
+            # Check if at least first author matches
+            if fn_surnames[0] in ws_surnames or ws_surnames[0] in [a.lower() for a in fn_authors]:
+                # Verified - use WebSearch results but mark as filename-verified
+                entry['websearch_authors'] = ws_authors
+                entry['websearch_year'] = ws_year
+                entry['websearch_source'] = ws_source
+                entry['websearch_status'] = 'done'
+                entry['filename_verified'] = True
+                filename_verified_count += 1
+                entry['websearch_at'] = datetime.now().isoformat()
+                search_count += 1
+
+                if search_count % SAVE_INTERVAL == 0:
+                    save_progress(progress)
+                    print(f"Progress saved at {search_count}")
+                continue
+
+    # Step 2: Check if title needs normalization (garbled/concatenated text)
+    title = entry.get('title', '')
+    search_title = title
+
+    if title:
+        # Detect garbled title: has very long "words" (concatenated text)
+        words = title.split()
+        has_long_words = any(len(w) > 30 for w in words) if words else False
+        few_words = len(words) < 3
+
+        if has_long_words or few_words:
+            # Try to normalize with GPT
+            normalized = normalize_title_with_gpt(title)
+            if normalized and normalized != title:
+                search_title = normalized
+                entry['title_normalized'] = normalized
+                title_normalized_count += 1
+
+    # Step 3: Perform WebSearch with (possibly normalized) title
+    ws_authors, ws_year, ws_source = websearch_authors(search_title)
 
     entry['websearch_authors'] = ws_authors if ws_authors else []
     entry['websearch_year'] = ws_year
@@ -2750,6 +2936,8 @@ ws_not_found = sum(1 for x in pdf_data if x.get('status') != 'japanese' and x.ge
 
 print(f"\nWebSearch complete at {datetime.now()}")
 print(f"  - Newly searched: {search_count}")
+print(f"  - Filename verified (Author_Year.pdf format): {filename_verified_count}")
+print(f"  - Title normalized by GPT: {title_normalized_count}")
 print(f"Files with WebSearch results: {ws_success}")
 print(f"  - From Semantic Scholar: {ws_semantic}")
 print(f"  - From CrossRef: {ws_crossref}")
@@ -3243,6 +3431,20 @@ print(f"  Files to rename: {success_count}")
 print(f"  Files to move to alert/: {alert_count}")
 print(f"  Files to move to failure/: {failure_count}")
 print(f"  Files to move to japanese/: {japanese_count}")
+
+# Update progress with Cell 10 changes (GPT validation results)
+for item in pdf_data:
+    file_hash = item.get('file_hash', '')
+    if file_hash and file_hash in progress['by_hash']:
+        progress['by_hash'][file_hash].update({
+            'status': item['status'],
+            'final_authors': item.get('final_authors'),
+            'fail_reason': item.get('fail_reason'),
+            'gpt_rejected_authors': item.get('gpt_rejected_authors'),
+            'gpt_final_corrected': item.get('gpt_final_corrected'),
+        })
+save_progress(progress)
+print("Progress saved after filename generation.")
 
 # %%
 # Cell 11: Preview changes before renaming
