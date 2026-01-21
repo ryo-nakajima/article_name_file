@@ -2892,8 +2892,24 @@ for i, file_hash in enumerate(to_search):
                     print(f"Progress saved at {search_count}")
                 continue
 
-        # WebSearch didn't find matching authors - but filename format is valid
-        # Trust the filename (human-assigned names are reliable)
+            # Authors don't match - but WebSearch found valid authors
+            # Use WebSearch results (more reliable than filename which might be wrong)
+            # e.g., "Edicine_2009.pdf" where "Edicine" is not an author but WebSearch finds "Austin"
+            entry['websearch_authors'] = ws_authors
+            entry['websearch_year'] = ws_year
+            entry['websearch_source'] = ws_source
+            entry['websearch_status'] = 'done'
+            entry['filename_mismatch'] = True  # Flag that filename didn't match
+            entry['websearch_at'] = datetime.now().isoformat()
+            search_count += 1
+
+            if search_count % SAVE_INTERVAL == 0:
+                save_progress(progress)
+                print(f"Progress saved at {search_count}")
+            continue
+
+        # WebSearch didn't find any authors - trust the filename format
+        # (human-assigned names are reliable when no other source available)
         entry['websearch_authors'] = []
         entry['websearch_year'] = None
         entry['websearch_source'] = None
