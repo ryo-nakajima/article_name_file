@@ -160,6 +160,24 @@ def should_process_websearch(progress: Dict, file_hash: str) -> bool:
     if status in ('fail', 'alert'):
         return True  # Re-process failed/alert files
 
+    # Re-process files with journal-like suffix after year (e.g., Author_2020_AER.pdf)
+    # Skip single-letter suffixes (_a, _b, _c) which are for disambiguation
+    filename = entry.get('filename', '')
+    if filename.lower().endswith('.pdf'):
+        base = filename[:-4]
+        parts = base.split('_')
+        if len(parts) >= 2:
+            # Find year position
+            for i, part in enumerate(parts):
+                if re.match(r'^\d{4}$', part) and i < len(parts) - 1:
+                    # Year is not the last part - check suffix length
+                    suffix = '_'.join(parts[i+1:])
+                    # Only reprocess if suffix is 2+ characters (journal abbreviation)
+                    # Skip single lowercase letter (disambiguation suffix like _a, _b)
+                    if not (len(suffix) == 1 and suffix.islower()):
+                        return True
+                    break
+
     # Process if websearch not done
     websearch_status = entry.get('websearch_status', '')
     if websearch_status in ('done', 'not_found'):
@@ -442,6 +460,8 @@ def parse_existing_filename(filename: str) -> Tuple[List[str], Optional[str], bo
     - Author_Author_Year.pdf
     - Author_et_al_Year.pdf
     - Author_Year_a.pdf (with suffix)
+    - Author_Year_AER.pdf (with journal abbreviation suffix)
+    - Author_et_al_Year_QJE.pdf
 
     Returns:
         (authors, year, is_valid_format)
@@ -451,37 +471,46 @@ def parse_existing_filename(filename: str) -> Tuple[List[str], Optional[str], bo
 
     base = filename[:-4]  # Remove .pdf
 
-    # Remove trailing suffix like _a, _b, _c
-    suffix_match = re.match(r'^(.+)_([a-z])$', base)
-    if suffix_match:
-        base = suffix_match.group(1)
+    # Split by underscore
+    parts = base.split('_')
+    if len(parts) < 2:
+        return [], None, False
 
-    # Pattern 1: Author_et_al_Year
-    et_al_match = re.match(r'^([A-Z][a-zA-Z\u00C0-\u024F]+)_et_al_(\d{4})$', base)
-    if et_al_match:
-        author = et_al_match.group(1)
-        year = et_al_match.group(2)
+    # Find the position of a 4-digit year in the parts
+    year_index = None
+    for i, part in enumerate(parts):
+        if re.match(r'^\d{4}$', part):
+            year_index = i
+            break  # Use the first year found
+
+    if year_index is None:
+        return [], None, False
+
+    year = parts[year_index]
+    author_parts = parts[:year_index]  # Everything before the year
+
+    if not author_parts:
+        return [], None, False
+
+    # Check for et_al pattern
+    if len(author_parts) >= 3 and author_parts[-2].lower() == 'et' and author_parts[-1].lower() == 'al':
+        # Author_et_al_Year pattern
+        author = author_parts[0]
         if is_valid_surname(author):
             return [author], year, True
+        return [], None, False
 
-    # Pattern 2: Author(_Author)*_Year
-    # Split by underscore and check if last part is year
-    parts = base.split('_')
-    if len(parts) >= 2:
-        potential_year = parts[-1]
-        if re.match(r'^\d{4}$', potential_year):
-            authors = parts[:-1]
-            # Validate all authors
-            valid_authors = []
-            for a in authors:
-                # Skip 'et' and 'al' as they're part of et_al pattern
-                if a.lower() in ('et', 'al'):
-                    continue
-                if is_valid_surname(a):
-                    valid_authors.append(a)
+    # Regular pattern: Author(_Author)*_Year
+    valid_authors = []
+    for a in author_parts:
+        # Skip 'et' and 'al' as they're part of et_al pattern
+        if a.lower() in ('et', 'al'):
+            continue
+        if is_valid_surname(a):
+            valid_authors.append(a)
 
-            if valid_authors:
-                return valid_authors, potential_year, True
+    if valid_authors:
+        return valid_authors, year, True
 
     return [], None, False
 
@@ -3573,6 +3602,22 @@ if EXECUTE_RENAME:
                 errors.append({'old': old_name, 'new': f'japanese/{old_name}', 'reason': str(e)})
             continue
 
+        # Handle OCR-only papers - move to re-search folder for manual verification
+        # Check OCR BEFORE failure so OCR files go to re-search even if they failed
+        title_method = item.get('title_method') or ''
+        if title_method.startswith('ocr'):
+            new_name = item.get('new_filename') or old_name  # Use original name if no new name
+            new_path = os.path.join(research_dir, new_name)
+            try:
+                if not os.path.exists(new_path):
+                    os.rename(old_path, new_path)
+                    moved_research.append({'old': old_name, 'new': f're-search/{new_name}'})
+                else:
+                    errors.append({'old': old_name, 'new': f're-search/{new_name}', 'reason': 'path conflict'})
+            except Exception as e:
+                errors.append({'old': old_name, 'new': f're-search/{new_name}', 'reason': str(e)})
+            continue
+
         # Handle fail papers - move to failure folder (no rename)
         if item.get('move_to_failure'):
             new_path = os.path.join(failure_dir, old_name)
@@ -3585,20 +3630,6 @@ if EXECUTE_RENAME:
                     errors.append({'old': old_name, 'new': f'failure/{old_name}', 'reason': 'path conflict'})
             except Exception as e:
                 errors.append({'old': old_name, 'new': f'failure/{old_name}', 'reason': str(e)})
-            continue
-
-        # Handle OCR-only papers - move to re-search folder for manual verification
-        if item.get('title_method') == 'ocr' and item.get('new_filename'):
-            new_name = item['new_filename']
-            new_path = os.path.join(research_dir, new_name)
-            try:
-                if not os.path.exists(new_path):
-                    os.rename(old_path, new_path)
-                    moved_research.append({'old': old_name, 'new': f're-search/{new_name}'})
-                else:
-                    errors.append({'old': old_name, 'new': f're-search/{new_name}', 'reason': 'path conflict'})
-            except Exception as e:
-                errors.append({'old': old_name, 'new': f're-search/{new_name}', 'reason': str(e)})
             continue
 
         # Handle regular renaming (includes alert files - they are renamed but tracked separately)
@@ -3676,11 +3707,12 @@ else:
             print(f"  {item['filename']} -> japanese/")
 
     # Show preview of OCR-only files
-    ocr_files = [x for x in pdf_data if x.get('title_method') == 'ocr']
+    ocr_files = [x for x in pdf_data if (x.get('title_method') or '').startswith('ocr')]
     if ocr_files:
         print(f"\nOCR-only files to be moved to re-search/ ({len(ocr_files)}):")
         for item in ocr_files[:10]:
-            print(f"  {item['filename']} -> re-search/")
+            new_name = item.get('new_filename') or item['filename']
+            print(f"  {item['filename']} -> re-search/{new_name}")
 
 # %%
 # Cell 13: Save final results
