@@ -515,6 +515,157 @@ def parse_existing_filename(filename: str) -> Tuple[List[str], Optional[str], bo
     return [], None, False
 
 
+# ============================================================================
+# BOILERPLATE DETECTION - Used to reject JSTOR/publisher copyright text
+# ============================================================================
+
+# Common boilerplate patterns that should NEVER appear in titles
+BOILERPLATE_INDICATORS = [
+    'collaborating with jstor',
+    'jstor is a not-for-profit',
+    'american economic association is collaborating',
+    'your use of the jstor archive',
+    'terms and conditions',
+    'this content downloaded',
+    'all use subject to',
+    'accessed:',
+    'please contact jstor',
+    'digitize, preserve and extend',
+    'trusted digital archive',
+    'stable url:',
+    'linked references are available',
+    'for more information about jstor',
+]
+
+# Patterns that indicate JSTOR cover page structure
+JSTOR_COVER_INDICATORS = [
+    'jstor is a not-for-profit',
+    'your use of the jstor archive',
+    'this content downloaded from',
+]
+
+
+def is_boilerplate_text(text: str) -> bool:
+    """Check if text is boilerplate/copyright text that should be rejected as title."""
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(ind in text_lower for ind in BOILERPLATE_INDICATORS)
+
+
+def is_jstor_cover_page(text: str) -> bool:
+    """Check if the page is a JSTOR cover page with structured metadata."""
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(ind in text_lower for ind in JSTOR_COVER_INDICATORS)
+
+
+def extract_title_from_jstor_cover(text: str) -> Optional[str]:
+    """
+    Extract title from JSTOR cover page using its known structure.
+
+    JSTOR cover page structure (common patterns):
+    Pattern A: Publisher name first
+    - Line 0: Publisher name (e.g., "American Economic Association")
+    - Line 1+: Title (may span multiple lines)
+    - "Author(s):" line marks end of title
+
+    Pattern B: Title first
+    - Line 0: Title (may span multiple lines)
+    - "Author(s):" line marks end of title
+
+    Returns:
+        Extracted title or None if extraction fails
+    """
+    lines = text.split('\n')
+
+    title_lines = []
+    started = False
+
+    # Known publisher/journal names to skip
+    publisher_patterns = [
+        'american economic association',
+        'econometric society',
+        'quarterly journal of economics',
+        'journal of political economy',
+        'review of economic studies',
+        'economic journal',
+        'national bureau of economic research',
+        'rand journal of economics',
+        'journal of labor economics',
+        'journal of finance',
+        'journal of monetary economics',
+        'journal of econometrics',
+        'oxford university press',
+        'cambridge university press',
+        'wiley',
+        ', ltd.',
+        ', inc.',
+    ]
+
+    for i, line in enumerate(lines):
+        line = line.strip()
+
+        # Skip empty lines
+        if not line:
+            continue
+
+        # Skip first non-empty line IF it looks like a publisher name
+        if not started:
+            line_lower = line.lower()
+            # Check if it's a known publisher
+            is_publisher = any(pub in line_lower for pub in publisher_patterns)
+
+            # Only skip if it's a KNOWN publisher name
+            # Don't skip generic short lines - they might be titles
+            if is_publisher and i == 0:
+                started = True
+                continue
+            started = True
+
+        # Stop at Author(s) line
+        if line.lower().startswith('author(s)') or line.lower().startswith('authors:'):
+            break
+
+        # Stop at Source line
+        if line.lower().startswith('source:'):
+            break
+
+        # Stop at URL patterns
+        if line.lower().startswith('stable url') or line.lower().startswith('http'):
+            break
+
+        # Stop at boilerplate
+        if is_boilerplate_text(line):
+            break
+
+        # Stop at "Published by" line
+        if line.lower().startswith('published by'):
+            break
+
+        # Add to title if it looks like title text
+        if len(line) > 3:
+            title_lines.append(line)
+
+        # Limit title to 5 lines max
+        if len(title_lines) >= 5:
+            break
+
+    if title_lines:
+        title = ' '.join(title_lines)
+        # Clean up
+        title = re.sub(r'\s+', ' ', title).strip()
+        # Remove trailing special characters
+        title = re.sub(r'[\d\*†‡§¶]+$', '', title).strip()
+
+        # Validate: reasonable length, not boilerplate
+        if 15 <= len(title) <= 300 and not is_boilerplate_text(title):
+            return title
+
+    return None
+
+
 def find_title_candidates(page, max_candidates: int = 5) -> List[Dict]:
     """
     Find title candidates using multiple indicators with flexible scoring.
@@ -647,6 +798,10 @@ def find_title_candidates(page, max_candidates: int = 5) -> List[Dict]:
             text = item['text']
 
             if len(text) < 15 or len(text) > 300:
+                continue
+
+            # CRITICAL: Skip boilerplate/copyright text (JSTOR, etc.)
+            if is_boilerplate_text(text):
                 continue
 
             # Skip metadata patterns (but not ALL CAPS titles)
@@ -910,9 +1065,17 @@ def extract_title_from_pdf(pdf_path: str, use_ocr_fallback: bool = True, use_gpt
                 elif len(re.findall(r'\(cid:\d+\)', text[:500])) > 5:
                     error_reason = 'cid_format'
                 else:
+                    # === JSTOR COVER PAGE HANDLING ===
+                    # JSTOR PDFs have a structured cover page - extract title specially
+                    if is_jstor_cover_page(text):
+                        jstor_title = extract_title_from_jstor_cover(text)
+                        if jstor_title and not is_boilerplate_text(jstor_title):
+                            method = 'text_jstor'
+                            return jstor_title, method, None
+
                     # Try font/position-based detection with GPT validation
                     title = find_title_with_gpt_validation(page, text, use_gpt=use_gpt)
-                    if title:
+                    if title and not is_boilerplate_text(title):
                         method = 'text_gpt' if use_gpt else 'text'
                         return title, method, None
 
@@ -921,6 +1084,10 @@ def extract_title_from_pdf(pdf_path: str, use_ocr_fallback: bool = True, use_gpt
                     for line in lines[:25]:
                         line = line.strip()
                         if len(line) < 15:
+                            continue
+
+                        # Skip boilerplate text
+                        if is_boilerplate_text(line):
                             continue
 
                         skip_patterns = [
@@ -944,7 +1111,8 @@ def extract_title_from_pdf(pdf_path: str, use_ocr_fallback: bool = True, use_gpt
                         if 20 <= len(line) <= 200:
                             title = re.sub(r'\s+', ' ', line).strip()
                             title = re.sub(r'[\d\*†‡§¶]+$', '', title).strip()
-                            if len(title) >= 15:
+                            # Final boilerplate check before returning
+                            if len(title) >= 15 and not is_boilerplate_text(title):
                                 return title, 'text', None
 
                     error_reason = 'no_title_found'
@@ -3580,6 +3748,58 @@ if EXECUTE_RENAME:
     moved_research = []
     moved_failure = []
     errors = []
+    moved_hash_duplicates = []  # Files with same hash as another file
+
+    # --- Pre-process: Handle files not in pdf_data (hash collision orphans) ---
+    # These are files that weren't processed because another file with same hash already existed
+    pdf_data_filenames = {item['filename'] for item in pdf_data}
+    all_article_pdfs = [f for f in os.listdir(ARTICLES_DIR)
+                        if f.lower().endswith('.pdf') and os.path.isfile(os.path.join(ARTICLES_DIR, f))]
+    orphan_files = [f for f in all_article_pdfs if f not in pdf_data_filenames]
+
+    if orphan_files:
+        print(f"Found {len(orphan_files)} files not in progress data (hash collision orphans)")
+
+        # Build hash -> filename mapping from pdf_data
+        hash_to_processed = {}
+        for item in pdf_data:
+            file_hash = item.get('hash')
+            if file_hash:
+                hash_to_processed[file_hash] = item
+
+        # Create duplicate folder
+        dup_dir = os.path.join(ARTICLES_DIR, 'duplicate')
+        if not os.path.exists(dup_dir):
+            os.makedirs(dup_dir)
+
+        for orphan in orphan_files:
+            orphan_path = os.path.join(ARTICLES_DIR, orphan)
+            if not os.path.exists(orphan_path):
+                continue
+
+            orphan_hash = calculate_file_hash(orphan_path)
+
+            # Check if this hash was processed under a different filename
+            if orphan_hash in hash_to_processed:
+                processed_item = hash_to_processed[orphan_hash]
+                processed_filename = processed_item.get('new_filename') or processed_item['filename']
+
+                # This file is a duplicate - move to duplicate folder
+                dup_path = os.path.join(dup_dir, orphan)
+                if os.path.exists(dup_path):
+                    base, ext = os.path.splitext(orphan)
+                    dup_path = os.path.join(dup_dir, f"{base}_{datetime.now().strftime('%H%M%S')}{ext}")
+
+                try:
+                    os.rename(orphan_path, dup_path)
+                    moved_hash_duplicates.append({
+                        'old': orphan,
+                        'new': f'duplicate/{os.path.basename(dup_path)}',
+                        'duplicate_of': processed_filename
+                    })
+                    print(f"  Moved hash duplicate: {orphan} -> duplicate/ (same as {processed_filename})")
+                except Exception as e:
+                    errors.append({'old': orphan, 'new': f'duplicate/{orphan}', 'reason': str(e)})
 
     for item in pdf_data:
         old_name = item['filename']
@@ -3655,7 +3875,40 @@ if EXECUTE_RENAME:
                         'author_source': item.get('author_source')
                     })
             else:
-                errors.append({'old': old_name, 'new': new_name, 'reason': 'path conflict'})
+                # Path conflict: check if same content (duplicate) or different content (need suffix)
+                old_hash = calculate_file_hash(old_path)
+                existing_hash = calculate_file_hash(new_path)
+
+                if old_hash == existing_hash:
+                    # Same content - move to duplicate folder
+                    dup_dir = os.path.join(ARTICLES_DIR, 'duplicate')
+                    if not os.path.exists(dup_dir):
+                        os.makedirs(dup_dir)
+                    dup_path = os.path.join(dup_dir, old_name)
+                    if os.path.exists(dup_path):
+                        # Add timestamp if duplicate name exists
+                        base, ext = os.path.splitext(old_name)
+                        dup_path = os.path.join(dup_dir, f"{base}_{datetime.now().strftime('%H%M%S')}{ext}")
+                    os.rename(old_path, dup_path)
+                    renamed.append({'old': old_name, 'new': f'duplicate/{os.path.basename(dup_path)}',
+                                   'note': 'same content as existing file'})
+                else:
+                    # Different content - add disambiguation suffix
+                    base_name, ext = os.path.splitext(new_name)
+                    suffix_char = 'a'
+                    while True:
+                        suffixed_name = f"{base_name}_{suffix_char}{ext}"
+                        suffixed_path = os.path.join(ARTICLES_DIR, suffixed_name)
+                        if not os.path.exists(suffixed_path):
+                            os.rename(old_path, suffixed_path)
+                            renamed.append({'old': old_name, 'new': suffixed_name,
+                                           'note': 'added suffix due to name conflict'})
+                            break
+                        suffix_char = chr(ord(suffix_char) + 1)
+                        if suffix_char > 'z':
+                            errors.append({'old': old_name, 'new': new_name,
+                                          'reason': 'path conflict - exhausted suffixes'})
+                            break
         except Exception as e:
             errors.append({'old': old_name, 'new': new_name, 'reason': str(e)})
 
@@ -3664,6 +3917,7 @@ if EXECUTE_RENAME:
     print(f"  Moved to japanese/: {len(moved_japanese)}")
     print(f"  Moved to failure/: {len(moved_failure)}")
     print(f"  Moved to re-search/: {len(moved_research)}")
+    print(f"  Moved hash duplicates: {len(moved_hash_duplicates)}")
     print(f"  Errors: {len(errors)}")
 
     # Show alert details (for reference)
@@ -3681,6 +3935,7 @@ if EXECUTE_RENAME:
             'moved_japanese': moved_japanese,
             'moved_failure': moved_failure,
             'moved_research': moved_research,
+            'moved_hash_duplicates': moved_hash_duplicates,
             'errors': errors,
             'timestamp': datetime.now().isoformat()
         }, f, ensure_ascii=False, indent=2)
