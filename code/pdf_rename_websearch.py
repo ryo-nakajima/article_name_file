@@ -1037,6 +1037,35 @@ def find_title_with_gpt_validation(page, pdf_text: str, use_gpt: bool = True) ->
     return candidates[0]['text']
 
 
+def check_pdf_has_extractable_text(pdf_path: str) -> bool:
+    """
+    Check if a PDF has extractable text content.
+    Returns False if PDF is image-based (requires OCR).
+
+    Used to determine if file should go to re-search/ folder.
+    """
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if not pdf.pages:
+                return False
+
+            # Check first page for text
+            page = pdf.pages[0]
+            text = page.extract_text() or ""
+
+            # No text or very little text
+            if not text or len(text) < 50:
+                return False
+
+            # CID format (image-based text)
+            if len(re.findall(r'\(cid:\d+\)', text[:500])) > 5:
+                return False
+
+            return True
+    except Exception:
+        return False
+
+
 def extract_title_from_pdf(pdf_path: str, use_ocr_fallback: bool = True, use_gpt: bool = True) -> Tuple[Optional[str], str, Optional[str]]:
     """
     Extract the paper title from PDF first page.
@@ -2898,6 +2927,7 @@ for i, (file_hash, filename) in enumerate(to_process):
             'title': None,
             'title_method': 'none',
             'title_error': 'japanese',
+            'pdf_has_text': True,  # Japanese PDFs have text, just not processable
             'meta_authors': [],
             'meta_year': None,
             'websearch_authors': None,
@@ -2911,6 +2941,9 @@ for i, (file_hash, filename) in enumerate(to_process):
             'extracted_at': datetime.now().isoformat()
         }
     else:
+        # Check if PDF has extractable text (for re-search/ determination)
+        pdf_has_text = check_pdf_has_extractable_text(path)
+
         title, method, error = extract_title_from_pdf(path)
         meta_authors, meta_year = extract_metadata(path)
 
@@ -2920,6 +2953,7 @@ for i, (file_hash, filename) in enumerate(to_process):
             'title': title,
             'title_method': method,
             'title_error': error,
+            'pdf_has_text': pdf_has_text,  # False = image-based PDF, needs OCR
             'meta_authors': meta_authors,
             'meta_year': meta_year,
             'websearch_authors': None,
@@ -3787,10 +3821,10 @@ if EXECUTE_RENAME:
                 errors.append({'old': old_name, 'new': f'japanese/{old_name}', 'reason': str(e)})
             continue
 
-        # Handle OCR-only papers - move to re-search folder for manual verification
-        # Check OCR BEFORE failure so OCR files go to re-search even if they failed
-        title_method = item.get('title_method') or ''
-        if title_method.startswith('ocr'):
+        # Handle image-based PDFs - move to re-search folder for manual verification
+        # These are PDFs with no extractable text (requires OCR for any information)
+        # PDFs that have text but used OCR for title extraction are NOT moved here
+        if not item.get('pdf_has_text', True):
             new_name = item.get('new_filename') or old_name  # Use original name if no new name
             new_path = os.path.join(research_dir, new_name)
             try:
@@ -3940,11 +3974,11 @@ else:
         for item in japanese_files[:10]:
             print(f"  {item['filename']} -> japanese/")
 
-    # Show preview of OCR-only files
-    ocr_files = [x for x in pdf_data if (x.get('title_method') or '').startswith('ocr')]
-    if ocr_files:
-        print(f"\nOCR-only files to be moved to re-search/ ({len(ocr_files)}):")
-        for item in ocr_files[:10]:
+    # Show preview of image-based PDFs (no extractable text)
+    image_pdfs = [x for x in pdf_data if not x.get('pdf_has_text', True)]
+    if image_pdfs:
+        print(f"\nImage-based PDFs to be moved to re-search/ ({len(image_pdfs)}):")
+        for item in image_pdfs[:10]:
             new_name = item.get('new_filename') or item['filename']
             print(f"  {item['filename']} -> re-search/{new_name}")
 
