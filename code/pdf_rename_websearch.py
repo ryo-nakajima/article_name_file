@@ -1606,75 +1606,6 @@ Output: "Estimating Dynamic Discrete Choice Models with Hyperbolic Discounting"
         return None
 
 
-def validate_surnames_with_gpt(names: List[str]) -> List[str]:
-    """
-    Use GPT to validate and filter a list of potential surnames.
-    Returns only names that are likely valid academic author surnames.
-
-    Args:
-        names: List of potential surname strings
-
-    Returns:
-        Filtered list of valid surnames
-    """
-    if not names:
-        return []
-
-    # Pre-filter obvious non-surnames
-    filtered = [n for n in names if n and len(n) >= 2 and len(n) <= 25]
-    if not filtered:
-        return []
-
-    names_str = ", ".join(filtered)
-
-    messages = [
-        {
-            "role": "system",
-            "content": """You are an expert at identifying valid academic author surnames.
-Given a list of potential surnames, return ONLY the ones that are plausible human surnames.
-
-Rules:
-- Remove common words (the, and, for, with, etc.)
-- Remove journal/publication terms (journal, review, economics, etc.)
-- Remove institutional names (university, institute, etc.)
-- Remove first names used alone (David, John, Mary, etc.)
-- Keep valid surnames from any cultural background (Western, Asian, etc.)
-- Format: Return valid surnames as comma-separated list
-- If none are valid, return "NONE"
-
-Examples:
-Input: "Smith, Economics, Journal, Chen, Labor"
-Output: "Smith, Chen"
-
-Input: "The, And, Review, Markets"
-Output: "NONE" """
-        },
-        {
-            "role": "user",
-            "content": f"Validate these potential surnames: {names_str}"
-        }
-    ]
-
-    response = call_gpt_with_retry(messages, max_tokens=200)
-
-    if not response:
-        return names  # Return original list on error
-
-    result = response.choices[0].message.content.strip()
-
-    if result == "NONE":
-        return []
-
-    # Parse the comma-separated result
-    validated = [n.strip() for n in result.split(",") if n.strip()]
-
-    # Normalize case
-    validated = [normalize_case(n) for n in validated if n]
-    validated = [n for n in validated if n]
-
-    return validated
-
-
 def get_title_and_authors_with_gpt(text: str, max_chars: int = 4000) -> Tuple[Optional[str], List[str], Optional[str]]:
     """
     Use GPT to extract both title and authors from PDF text in a single call.
@@ -2554,7 +2485,7 @@ Extract author surnames and year."""
         ]
 
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=GPT_MODEL,
             messages=messages,
             response_format={"type": "json_object"},
             temperature=0.1,
@@ -3551,21 +3482,31 @@ print(f"  Fail: {fail_count}")
 # Cell 10: Generate new filenames
 
 def generate_filename(authors: List[str], year: str, existing: set) -> Optional[str]:
-    """Generate filename from authors and year."""
+    """Generate filename from authors and year.
+
+    Naming convention:
+    - 1 author: Author_Year.pdf
+    - 2 authors: Author_Author_Year.pdf
+    - 3 authors: Author_Author_Author_Year.pdf
+    - 4+ authors: Author_et_al_Year.pdf
+    """
     if not authors:
         return None
-    
+
     authors = [normalize_case(a) for a in authors if a]
     authors = [a for a in authors if a and is_valid_surname(a)]
-    
+
     if not authors:
         return None
-    
+
     if len(authors) == 1:
         author_part = authors[0]
     elif len(authors) == 2:
         author_part = f"{authors[0]}_{authors[1]}"
+    elif len(authors) == 3:
+        author_part = f"{authors[0]}_{authors[1]}_{authors[2]}"
     else:
+        # 4 or more authors: use et_al
         author_part = f"{authors[0]}_et_al"
     
     # Clean author part
@@ -3763,7 +3704,7 @@ if EXECUTE_RENAME:
         # Build hash -> filename mapping from pdf_data
         hash_to_processed = {}
         for item in pdf_data:
-            file_hash = item.get('hash')
+            file_hash = item.get('file_hash')
             if file_hash:
                 hash_to_processed[file_hash] = item
 
