@@ -2892,9 +2892,31 @@ for i, file_hash in enumerate(to_search):
                     print(f"Progress saved at {search_count}")
                 continue
 
+        # WebSearch didn't find matching authors - but filename format is valid
+        # Trust the filename (human-assigned names are reliable)
+        entry['websearch_authors'] = []
+        entry['websearch_year'] = None
+        entry['websearch_source'] = None
+        entry['websearch_status'] = 'not_found'
+        entry['filename_trusted'] = True  # Mark as trusted from filename
+        entry['filename_authors'] = fn_authors
+        entry['filename_year'] = fn_year
+        entry['websearch_at'] = datetime.now().isoformat()
+        filename_verified_count += 1
+        search_count += 1
+
+        if search_count % SAVE_INTERVAL == 0:
+            save_progress(progress)
+            print(f"Progress saved at {search_count}")
+        continue
+
     # Step 2: Check if title needs normalization (garbled/concatenated text)
     title = entry.get('title', '')
     search_title = title
+
+    # Clean special characters that may interfere with WebSearch
+    if title:
+        search_title = re.sub(r'[†‡§¶*∗]+', '', title).strip()
 
     if title:
         # Detect garbled title: has very long "words" (concatenated text)
@@ -2996,10 +3018,14 @@ for i, item in enumerate(pdf_data):
         ws_valid = validated
 
     # Determine final authors
-    # Priority: WebSearch > Metadata (per user request)
+    # Priority: WebSearch > Filename (trusted) > Metadata
     if ws_valid:
         item['final_authors'] = ws_valid
         item['author_source'] = 'websearch'
+    elif item.get('filename_trusted') and item.get('filename_authors'):
+        # Filename was in Author_Year format and trusted
+        item['final_authors'] = item['filename_authors']
+        item['author_source'] = 'filename'
     elif meta_valid:
         item['final_authors'] = meta_valid
         item['author_source'] = 'metadata'
@@ -3369,10 +3395,10 @@ for i, item in enumerate(pdf_data):
         authors = item.get('final_authors', [])
         title = item.get('title', '')
 
-        # Final GPT validation for non-websearch sources
-        # WebSearch (CrossRef, Semantic Scholar) is trusted
+        # Final GPT validation for non-trusted sources
+        # WebSearch (CrossRef, Semantic Scholar) and Filename (human-assigned) are trusted
         author_source = item.get('author_source', '')
-        if GPT_FINAL_VALIDATION and authors and author_source not in ('websearch',):
+        if GPT_FINAL_VALIDATION and authors and author_source not in ('websearch', 'filename'):
             validated, _ = validate_surnames_with_gpt(authors, title, trust_source=False)
             if not validated:
                 # GPT rejected all authors - move to fail
