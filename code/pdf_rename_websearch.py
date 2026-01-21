@@ -2849,6 +2849,30 @@ if deleted_count > 0:
     print(f"Removed {deleted_count} entries for deleted files")
     save_progress(progress)
 
+# Detect files returned from failure/ or re-search/ and clear their cache for re-processing
+# This allows users to manually move files back to ARTICLES_DIR for another attempt
+returned_count = 0
+returned_from = {'failure': 0, 're-search': 0}
+for file_hash in list(progress['by_hash'].keys()):
+    entry = progress['by_hash'][file_hash]
+    moved_to = entry.get('moved_to')
+    if moved_to in ('failure', 're-search'):
+        if file_hash in current_hashes:
+            # File has returned to ARTICLES_DIR - clear cache for re-processing
+            old_filename = entry.get('filename', 'unknown')
+            print(f"  Re-processing: {old_filename} (returned from {moved_to}/)")
+            del progress['by_hash'][file_hash]
+            if file_hash in progress.get('hash_to_filename', {}):
+                del progress['hash_to_filename'][file_hash]
+            returned_count += 1
+            returned_from[moved_to] += 1
+
+if returned_count > 0:
+    save_progress(progress)
+    print(f"Cleared cache for {returned_count} returned files:")
+    print(f"  - From failure/: {returned_from['failure']}")
+    print(f"  - From re-search/: {returned_from['re-search']}")
+
 # Determine which files need processing
 to_process = []
 for file_hash, filename in current_files.items():
@@ -3773,6 +3797,11 @@ if EXECUTE_RENAME:
                 if not os.path.exists(new_path):
                     os.rename(old_path, new_path)
                     moved_research.append({'old': old_name, 'new': f're-search/{new_name}'})
+                    # Record moved_to flag for re-processing detection
+                    file_hash = item.get('file_hash')
+                    if file_hash and file_hash in progress['by_hash']:
+                        progress['by_hash'][file_hash]['moved_to'] = 're-search'
+                        progress['by_hash'][file_hash]['moved_at'] = datetime.now().isoformat()
                 else:
                     errors.append({'old': old_name, 'new': f're-search/{new_name}', 'reason': 'path conflict'})
             except Exception as e:
@@ -3787,6 +3816,11 @@ if EXECUTE_RENAME:
                     os.rename(old_path, new_path)
                     moved_failure.append({'old': old_name, 'new': f'failure/{old_name}',
                                          'fail_reason': item.get('fail_reason')})
+                    # Record moved_to flag for re-processing detection
+                    file_hash = item.get('file_hash')
+                    if file_hash and file_hash in progress['by_hash']:
+                        progress['by_hash'][file_hash]['moved_to'] = 'failure'
+                        progress['by_hash'][file_hash]['moved_at'] = datetime.now().isoformat()
                 else:
                     errors.append({'old': old_name, 'new': f'failure/{old_name}', 'reason': 'path conflict'})
             except Exception as e:
@@ -3891,6 +3925,10 @@ if EXECUTE_RENAME:
                 'timestamp': datetime.now().isoformat()
             }, f, ensure_ascii=False, indent=2)
         print(f"\nAlert list saved to {os.path.join(DATA_DIR, 'alert_files_list.json')}")
+
+    # Save progress with moved_to flags for re-processing detection
+    save_progress(progress)
+    print("Progress cache saved with moved_to flags.")
 else:
     print("EXECUTE_RENAME is False. Set to True to actually rename files.")
     print("Make sure you have a backup before proceeding!")
@@ -3972,6 +4010,127 @@ print(f"  - pdf_rename_data.json (full data)")
 print(f"  - pdf_rename_summary.json (summary)")
 print()
 print(json.dumps(summary, indent=2))
+
+# %%
+# Cell 13.5: Generate detailed failure report
+# - Documents why each file failed
+# - Records which processing steps were attempted
+# - Saves to failure_report.json for debugging
+
+print("\n=== Generating Failure Report ===")
+
+fail_files = [x for x in pdf_data if x['status'] == 'fail']
+print(f"Total failure files: {len(fail_files)}")
+
+failure_report = {
+    'generated_at': datetime.now().isoformat(),
+    'total_failures': len(fail_files),
+    'failure_summary': {},
+    'files': []
+}
+
+# Count failure reasons
+for item in fail_files:
+    reason = item.get('fail_reason', 'unknown')
+    failure_report['failure_summary'][reason] = failure_report['failure_summary'].get(reason, 0) + 1
+
+# Generate detailed report for each failure
+for item in fail_files:
+    # Determine processing progress
+    steps_completed = []
+    steps_failed = []
+
+    # Step 1: Title extraction
+    if item.get('title'):
+        steps_completed.append('title_extraction')
+    else:
+        steps_failed.append('title_extraction')
+
+    # Step 2: WebSearch
+    if item.get('websearch_status') == 'done':
+        if item.get('websearch_authors'):
+            steps_completed.append('websearch')
+        else:
+            steps_failed.append('websearch (no results)')
+    elif item.get('websearch_status') == 'not_found':
+        steps_failed.append('websearch (not found)')
+    elif item.get('title'):
+        steps_failed.append('websearch (not attempted or failed)')
+
+    # Step 3: PDF text search
+    if item.get('author_source', '').startswith('pdf_'):
+        steps_completed.append('pdf_text_search')
+    elif item.get('pdf_gpt_validation'):
+        steps_completed.append('pdf_text_search (attempted)')
+
+    # Step 4: OCR+GPT fallback
+    if item.get('ocr_gpt_attempted'):
+        if item.get('ocr_gpt_authors'):
+            steps_completed.append('ocr_gpt_fallback')
+        else:
+            steps_failed.append('ocr_gpt_fallback (no results)')
+
+    # Step 5: GPT final validation
+    if item.get('gpt_rejected_authors'):
+        steps_failed.append('gpt_final_validation (rejected)')
+
+    # Build detailed entry
+    entry = {
+        'filename': item.get('filename'),
+        'file_hash': item.get('file_hash'),
+        'fail_reason': item.get('fail_reason', 'unknown'),
+        'processing_progress': {
+            'steps_completed': steps_completed,
+            'steps_failed': steps_failed,
+            'furthest_step': steps_completed[-1] if steps_completed else 'none'
+        },
+        'extraction_details': {
+            'title': item.get('title'),
+            'title_method': item.get('title_method'),
+            'title_error': item.get('title_error'),
+        },
+        'author_search_details': {
+            'websearch_status': item.get('websearch_status'),
+            'websearch_source': item.get('websearch_source'),
+            'websearch_authors': item.get('websearch_authors'),
+            'meta_authors': item.get('meta_authors'),
+            'ocr_gpt_authors': item.get('ocr_gpt_authors'),
+            'gpt_rejected_authors': item.get('gpt_rejected_authors'),
+        },
+        'year_details': {
+            'meta_year': item.get('meta_year'),
+            'websearch_year': item.get('websearch_year'),
+            'final_year': item.get('final_year'),
+        },
+        'timestamps': {
+            'extracted_at': item.get('extracted_at'),
+            'websearch_at': item.get('websearch_at'),
+        }
+    }
+
+    failure_report['files'].append(entry)
+
+# Save failure report
+failure_report_path = os.path.join(DATA_DIR, 'failure_report.json')
+with open(failure_report_path, 'w') as f:
+    json.dump(failure_report, f, ensure_ascii=False, indent=2)
+
+print(f"\nFailure report saved to: {failure_report_path}")
+print(f"\nFailure reasons breakdown:")
+for reason, count in sorted(failure_report['failure_summary'].items(), key=lambda x: -x[1]):
+    print(f"  {reason}: {count}")
+
+# Show sample of detailed failures
+print(f"\nSample failure details (first 5):")
+for entry in failure_report['files'][:5]:
+    print(f"\n  {entry['filename']}")
+    print(f"    Reason: {entry['fail_reason']}")
+    print(f"    Steps completed: {entry['processing_progress']['steps_completed']}")
+    print(f"    Steps failed: {entry['processing_progress']['steps_failed']}")
+    if entry['extraction_details']['title']:
+        print(f"    Title: {entry['extraction_details']['title'][:50]}...")
+    else:
+        print(f"    Title: (none) - error: {entry['extraction_details']['title_error']}")
 
 
 # %%
