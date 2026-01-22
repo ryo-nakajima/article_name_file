@@ -220,11 +220,10 @@ check_and_install_dependencies()
 openai_client = OpenAI()  # Uses OPENAI_API_KEY from environment
 GPT_MODEL = "gpt-4o-mini"  # Cost-effective model for this task
 
-# Directory paths
-# When running from code/, ARTICLES_DIR is the parent directory
-CODE_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() else os.getcwd()
-ARTICLES_DIR = os.path.dirname(CODE_DIR)  # Parent of code/
-DATA_DIR = os.path.join(CODE_DIR, 'data')  # code/data/ for JSON files
+# Directory paths - use absolute paths to avoid issues when running from different directories
+ARTICLES_DIR = '/Users/ryo2/Dropbox/Articles'
+CODE_DIR = os.path.join(ARTICLES_DIR, 'code')
+DATA_DIR = os.path.join(CODE_DIR, 'data')
 
 # Create data directory if it doesn't exist
 if not os.path.exists(DATA_DIR):
