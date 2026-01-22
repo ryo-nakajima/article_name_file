@@ -1043,6 +1043,8 @@ def check_pdf_has_extractable_text(pdf_path: str) -> bool:
     Returns False if PDF is image-based (requires OCR).
 
     Used to determine if file should go to re-search/ folder.
+    Only checks for text presence - PDFs with CID characters mixed in
+    are still considered to have text if meaningful content is extractable.
     """
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -1053,14 +1055,11 @@ def check_pdf_has_extractable_text(pdf_path: str) -> bool:
             page = pdf.pages[0]
             text = page.extract_text() or ""
 
-            # No text or very little text
+            # No text or very little text = image-based PDF
             if not text or len(text) < 50:
                 return False
 
-            # CID format (image-based text)
-            if len(re.findall(r'\(cid:\d+\)', text[:500])) > 5:
-                return False
-
+            # Has sufficient text content
             return True
     except Exception:
         return False
