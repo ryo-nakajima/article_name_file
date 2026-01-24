@@ -63,6 +63,67 @@ pip install pdfplumber pypdf pytesseract pdf2image openai requests jupytext
 export OPENAI_API_KEY="your-api-key"
 ```
 
+## 別PCでのセットアップ（Dropbox同期）
+
+このディレクトリはDropboxで同期されている。別のPCで使用する場合は以下の手順を実行。
+
+### 1. パスの変更
+
+`code/pdf_rename_websearch.py` の先頭付近にあるパス定義を変更:
+
+```python
+# 変更前（Mac）
+ARTICLES_DIR = '/Users/ryo2/Dropbox/Articles'
+
+# 変更後の例（Windows）
+ARTICLES_DIR = 'C:/Users/username/Dropbox/Articles'
+
+# 変更後の例（Linux）
+ARTICLES_DIR = '/home/username/Dropbox/Articles'
+```
+
+### 2. 変更をノートブックに反映
+
+```bash
+cd code
+jupytext --to notebook pdf_rename_websearch.py -o pdf_rename_websearch.ipynb
+```
+
+### 3. 依存パッケージのインストール
+
+```bash
+pip install pdfplumber pypdf pytesseract pdf2image openai requests jupytext
+```
+
+### 4. 外部ツールのインストール
+
+**Windows:**
+- Tesseract: https://github.com/UB-Mannheim/tesseract/wiki からインストーラをダウンロード
+- Poppler: https://github.com/osber/poppler-windows/releases からダウンロードしてPATHに追加
+
+**macOS:**
+```bash
+brew install tesseract tesseract-lang poppler
+```
+
+**Linux:**
+```bash
+sudo apt install tesseract-ocr tesseract-ocr-jpn poppler-utils
+```
+
+### 5. 環境変数の設定
+
+```bash
+# .bashrc / .zshrc に追加
+export OPENAI_API_KEY="your-api-key"
+```
+
+### 注意事項
+
+- **キャッシュファイル** (`code/data/*.json`) もDropboxで同期される。別PCで実行しても処理済みファイルはスキップされる。
+- **パス変更をコミットしない**: 別PCでパスを変更した場合、gitにコミットしないこと（他のPCで動かなくなる）。
+- パス変更後は必ず `jupytext` で `.ipynb` に同期すること。
+
 ## ディレクトリ構成
 
 ```
