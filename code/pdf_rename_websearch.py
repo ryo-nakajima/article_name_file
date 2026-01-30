@@ -3749,7 +3749,12 @@ if EXECUTE_RENAME:
 
     # --- Pre-process: Handle files not in pdf_data (hash collision orphans) ---
     # These are files that weren't processed because another file with same hash already existed
-    pdf_data_filenames = {item['filename'] for item in pdf_data}
+    # Include both old filenames and new filenames (from previous renames) to avoid false orphans
+    pdf_data_filenames = set()
+    for item in pdf_data:
+        pdf_data_filenames.add(item['filename'])
+        if item.get('new_filename'):
+            pdf_data_filenames.add(item['new_filename'])
     all_article_pdfs = [f for f in os.listdir(ARTICLES_DIR)
                         if f.lower().endswith('.pdf') and os.path.isfile(os.path.join(ARTICLES_DIR, f))]
     orphan_files = [f for f in all_article_pdfs if f not in pdf_data_filenames]
